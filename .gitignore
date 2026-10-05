@@ -1,0 +1,12 @@
+/target/
+/models/
+/.venv/
+*.part
+/tests/fixtures/*.jpg
+/tests/fixtures/images/
+/tests/fixtures/lossless/
+.DS_Store
+.env
+.env.*
+*.pem
+*.key

@@ -1,0 +1,13 @@
+Kimochi Manga OCR
+Native Rust inference and page grouping for Manga OCR and Comic Text Detector.
+
+Manga OCR: https://github.com/kha-white/manga-ocr (Apache-2.0)
+Model: kha-white/manga-ocr-base, revision aa6573bd10b0d446cbf622e29c3e084914df9741
+Apache license retained in LICENSE-APACHE.
+
+Comic Text Detector: https://github.com/dmMaze/comic-text-detector (GPL-3.0)
+Source revision 440b978563c71b758e31aaa315d100faba1efa2f.
+ONNX weights distributed by zyddnys/manga-image-translator, beta-0.2.1.
+Pinned asset provenance and checksums: scripts/model-manifest.json.
+This combined library is distributed under GPL-3.0-only. Test manga imagery
+is not bundled or licensed by this project.

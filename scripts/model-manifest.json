@@ -1,0 +1,17 @@
+{
+  "repository": "kha-white/manga-ocr-base",
+  "revision": "aa6573bd10b0d446cbf622e29c3e084914df9741",
+  "sha256": {
+    "config.json": "8c0e395de8fa699daaac21aee33a4ba9bd1309cfbff03147813d2a025f39f349",
+    "vocab.txt": "344fbb6b8bf18c57839e924e2c9365434697e0227fac00b88bb4899b78aa594d",
+    "preprocessor_config.json": "af4eb4d79cf61b47010fc0bc9352ee967579c417423b4917188d809b7e048948",
+    "pytorch_model.bin": "c63e0bb5b3ff798c5991de18a8e0956c7ee6d1563aca6729029815eda6f5c2eb"
+  },
+  "detector": {
+    "repository": "dmMaze/comic-text-detector",
+    "revision": "440b978563c71b758e31aaa315d100faba1efa2f",
+    "filename": "comic-text-detector.onnx",
+    "url": "https://github.com/zyddnys/manga-image-translator/releases/download/beta-0.2.1/comictextdetector.pt.onnx",
+    "sha256": "1a86ace74961413cbd650002e7bb4dcec4980ffa21b2f19b86933372071d718f"
+  }
+}
