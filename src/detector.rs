@@ -139,6 +139,15 @@ fn area(r: BoundingBox) -> u64 {
 /// clearly wider than tall horizontal. A squarish line (a column of two ellipses, one kana) says
 /// nothing, so 「……／かう」 is the column its かう is. With no vote, the block's own shape decides.
 fn orientation(bbox: BoundingBox, lines: &[[[u32; 2]; 4]]) -> Orientation {
+    vote(lines).unwrap_or(if bbox[3] - bbox[1] > (bbox[2] - bbox[0]) * 2 {
+        Orientation::Vertical
+    } else {
+        Orientation::Horizontal
+    })
+}
+/// The direction a block's lines vote for, or `None` when none is clearly long one way or the
+/// votes tie: a block of short text (……, んっ, one kana) whose direction its lines cannot show.
+fn vote(lines: &[[[u32; 2]; 4]]) -> Option<Orientation> {
     let tall = |w: u32, h: u32| h > w * 3 / 2;
     let vertical = lines
         .iter()
@@ -148,15 +157,10 @@ fn orientation(bbox: BoundingBox, lines: &[[[u32; 2]; 4]]) -> Orientation {
         .iter()
         .filter(|p| tall(p[2][1] - p[0][1], p[2][0] - p[0][0]))
         .count();
-    let decided = if vertical + horizontal > 0 {
-        vertical > horizontal
-    } else {
-        bbox[3] - bbox[1] > (bbox[2] - bbox[0]) * 2
-    };
-    if decided {
-        Orientation::Vertical
-    } else {
-        Orientation::Horizontal
+    match vertical.cmp(&horizontal) {
+        std::cmp::Ordering::Greater => Some(Orientation::Vertical),
+        std::cmp::Ordering::Less => Some(Orientation::Horizontal),
+        std::cmp::Ordering::Equal => None,
     }
 }
 fn intersection_fraction(a: BoundingBox, b: BoundingBox) -> f64 {
@@ -331,8 +335,26 @@ impl ComicTextDetector {
             .collect();
         let mut keep = contained.iter().map(|c| !c);
         accepted.retain(|_| keep.next().unwrap_or(true));
-        for group in &mut accepted {
-            group.orientation = orientation(group.bbox, &group.line_polygons);
+        // A block its own lines decide keeps that direction; the rest follow the page's majority,
+        // and only on a page with none decided does a block's own shape decide it.
+        let voted: Vec<_> = accepted.iter().map(|g| vote(&g.line_polygons)).collect();
+        let vertical = voted
+            .iter()
+            .filter(|v| **v == Some(Orientation::Vertical))
+            .count();
+        let horizontal = voted
+            .iter()
+            .filter(|v| **v == Some(Orientation::Horizontal))
+            .count();
+        let page = (vertical != horizontal).then_some(if vertical > horizontal {
+            Orientation::Vertical
+        } else {
+            Orientation::Horizontal
+        });
+        for (group, voted) in accepted.iter_mut().zip(voted) {
+            group.orientation = voted
+                .or(page)
+                .unwrap_or_else(|| orientation(group.bbox, &group.line_polygons));
         }
         // Deterministic local order; panel ordering is intentionally not inferred.
         accepted.sort_by_key(|g| (g.bbox[1], std::cmp::Reverse(g.bbox[0])));
@@ -446,6 +468,9 @@ mod tests {
             orientation([0, 0, 30, 30], &[rect(0, 0, 30, 30)]),
             Orientation::Horizontal
         );
+        // A squarish block's lines cannot say; on a page it follows the decided blocks.
+        assert_eq!(vote(&[rect(0, 0, 30, 30)]), None);
+        assert_eq!(vote(&bubble), Some(Orientation::Vertical));
     }
     #[test]
     fn overlap_is_scale_independent() {
