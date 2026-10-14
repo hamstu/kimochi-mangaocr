@@ -495,4 +495,55 @@ impl MangaOcr {
             .join("\n");
         Ok(PageResult { groups, full_text })
     }
+
+    /// `recognize_page` for an image that may be a whole page or a snip of a few words.
+    ///
+    /// The detector needs the context of a page around text to call it text, and a snip
+    /// drawn tight around one line (a sound effect, a single caption) can give it none: it
+    /// finds no block. Manga OCR itself was trained on exactly such crops, so when the
+    /// detector comes back empty the whole image is read as one block, and kept only if
+    /// the model is sure of it. Real text reads at a mean token log-probability near zero
+    /// (-0.003 to -0.11 on the upstream corpus and snips of whole bubbles); a page, or
+    /// artwork, read as one block is invented text below -0.7.
+    pub fn recognize_region<D: PageDetector + ?Sized>(
+        &mut self,
+        image: &RgbImage,
+        detector: &mut D,
+        options: &OcrOptions,
+        detection: &DetectionOptions,
+    ) -> Result<PageResult> {
+        let page = self.recognize_page(image, detector, options, detection)?;
+        if !page.groups.is_empty() {
+            return Ok(page);
+        }
+        let recognition = self.recognize(image, options)?;
+        let sure = recognition
+            .mean_log_probability
+            .is_some_and(|p| p >= WHOLE_IMAGE_MIN_LOG_PROBABILITY);
+        if recognition.text.is_empty() || !sure || recognition.truncated {
+            return Ok(page);
+        }
+        let (width, height) = image.dimensions();
+        let group = PageGroup {
+            id: "block-0".into(),
+            bbox: [0, 0, width, height],
+            orientation: if height > width {
+                Orientation::Vertical
+            } else {
+                Orientation::Horizontal
+            },
+            line_polygons: Vec::new(),
+            // Not a detection: the detector found nothing here.
+            detection_confidence: 0.,
+            recognition,
+        };
+        Ok(PageResult {
+            full_text: group.recognition.text.clone(),
+            groups: vec![group],
+        })
+    }
 }
+
+/// Below this mean token log-probability a whole-image read is invented text; see
+/// `MangaOcr::recognize_region`.
+pub const WHOLE_IMAGE_MIN_LOG_PROBABILITY: f64 = -0.3;

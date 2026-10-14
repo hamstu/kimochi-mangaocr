@@ -68,9 +68,17 @@ fn iou(a: BoundingBox, b: BoundingBox) -> f64 {
 }
 /// Top-left letterbox with black padding and half-pixel bilinear sampling,
 /// matching the detector's OpenCV preprocessing without OpenCV.
-fn pixels(image: &RgbImage, device: &Device) -> Result<(Tensor, u32, u32)> {
+///
+/// The reference stretches every image to fill the 1024 square. That suits the pages the
+/// detector was trained on, which are shrunk to fit, but a snip of a single bubble is
+/// blown up four- or eightfold: its glyphs come out over 100 pixels tall, far outside
+/// anything the model learned, and it finds nothing or splits columns into fragments
+/// ("めぐみさ", "みさんに"). With `upscale` off an image smaller than the square keeps its
+/// own scale, so a snip looks like a corner of an ordinary page. Pages are unaffected.
+fn pixels(image: &RgbImage, device: &Device, upscale: bool) -> Result<(Tensor, u32, u32)> {
     crate::preprocess::validate(image)?;
-    let ratio = SIZE as f64 / f64::from(image.width().max(image.height()));
+    let fit = SIZE as f64 / f64::from(image.width().max(image.height()));
+    let ratio = if upscale { fit } else { fit.min(1.) };
     let w = (f64::from(image.width()) * ratio).round().max(1.) as u32;
     let h = (f64::from(image.height()) * ratio).round().max(1.) as u32;
     let mut data = vec![0f32; 3 * SIZE * SIZE];
@@ -121,6 +129,11 @@ fn union(a: BoundingBox, b: BoundingBox) -> BoundingBox {
         a[2].max(b[2]),
         a[3].max(b[3]),
     ]
+}
+/// Share of a block that must lie inside a larger one for it to count as a duplicate.
+const CONTAINED: f64 = 0.8;
+fn area(r: BoundingBox) -> u64 {
+    u64::from(r[2] - r[0]) * u64::from(r[3] - r[1])
 }
 fn intersection_fraction(a: BoundingBox, b: BoundingBox) -> f64 {
     let area = f64::from(a[2] - a[0]) * f64::from(a[3] - a[1]);
@@ -210,7 +223,7 @@ impl ComicTextDetector {
         options: &DetectionOptions,
     ) -> Result<Vec<DetectedGroup>> {
         options.validate()?;
-        let (input, w, h) = pixels(image, &self.device)?;
+        let (input, w, h) = pixels(image, &self.device, false)?;
         let output = self.graph.forward(input)?;
         if output["blk"].dims() != [1, 64512, 7] || output["det"].dims() != [1, 2, SIZE, SIZE] {
             return Err(Error::ModelContract(
@@ -279,6 +292,21 @@ impl ComicTextDetector {
             // Unassociated DB components can be individual glyphs/artwork; block
             // confidence is required before generating text to limit hallucinations.
         }
+        // A block lying almost wholly inside a larger one is the same text found twice
+        // (non-maximum suppression compares overlap with the union, so it keeps a small
+        // box inside a big one); reading both would repeat the line.
+        let contained: Vec<bool> = (0..accepted.len())
+            .map(|i| {
+                let a = accepted[i].bbox;
+                accepted.iter().enumerate().any(|(j, other)| {
+                    let b = other.bbox;
+                    let larger = area(b) > area(a) || (area(b) == area(a) && j < i);
+                    j != i && larger && intersection_fraction(a, b) >= CONTAINED
+                })
+            })
+            .collect();
+        let mut keep = contained.iter().map(|c| !c);
+        accepted.retain(|_| keep.next().unwrap_or(true));
         for group in &mut accepted {
             let vertical = group
                 .line_polygons
@@ -331,7 +359,8 @@ mod tests {
             Backend::Cpu
         };
         let engine = ComicTextDetector::new("models/comic-text-detector.onnx", backend).unwrap();
-        let (input, _, _) = pixels(&image, &engine.device).unwrap();
+        // The reference was produced with the stretching letterbox.
+        let (input, _, _) = pixels(&image, &engine.device, true).unwrap();
         let dump = std::env::var("MANGAOCR_DETECTOR_DUMP").ok();
         let write = |name: &str, t: &Tensor| {
             if let Some(dir) = &dump {
@@ -374,6 +403,18 @@ mod tests {
                 );
             }
         }
+    }
+    #[test]
+    fn small_images_keep_their_scale_and_pages_are_shrunk_to_fit() {
+        let device = Device::Cpu;
+        let snip = RgbImage::from_pixel(80, 220, image::Rgb([255, 255, 255]));
+        let (_, w, h) = pixels(&snip, &device, false).unwrap();
+        assert_eq!((w, h), (80, 220));
+        let (_, w, h) = pixels(&snip, &device, true).unwrap();
+        assert_eq!((w, h), (372, 1024));
+        let page = RgbImage::from_pixel(1654, 1170, image::Rgb([255, 255, 255]));
+        let (_, w, h) = pixels(&page, &device, false).unwrap();
+        assert_eq!((w, h), (1024, 724));
     }
     #[test]
     fn overlap_is_scale_independent() {
