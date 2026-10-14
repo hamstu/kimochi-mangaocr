@@ -135,6 +135,30 @@ const CONTAINED: f64 = 0.8;
 fn area(r: BoundingBox) -> u64 {
     u64::from(r[2] - r[0]) * u64::from(r[3] - r[1])
 }
+/// A block's writing direction, by its lines: those clearly taller than wide vote vertical, those
+/// clearly wider than tall horizontal. A squarish line (a column of two ellipses, one kana) says
+/// nothing, so 「……／かう」 is the column its かう is. With no vote, the block's own shape decides.
+fn orientation(bbox: BoundingBox, lines: &[[[u32; 2]; 4]]) -> Orientation {
+    let tall = |w: u32, h: u32| h > w * 3 / 2;
+    let vertical = lines
+        .iter()
+        .filter(|p| tall(p[2][0] - p[0][0], p[2][1] - p[0][1]))
+        .count();
+    let horizontal = lines
+        .iter()
+        .filter(|p| tall(p[2][1] - p[0][1], p[2][0] - p[0][0]))
+        .count();
+    let decided = if vertical + horizontal > 0 {
+        vertical > horizontal
+    } else {
+        bbox[3] - bbox[1] > (bbox[2] - bbox[0]) * 2
+    };
+    if decided {
+        Orientation::Vertical
+    } else {
+        Orientation::Horizontal
+    }
+}
 fn intersection_fraction(a: BoundingBox, b: BoundingBox) -> f64 {
     let area = f64::from(a[2] - a[0]) * f64::from(a[3] - a[1]);
     f64::from(a[2].min(b[2]).saturating_sub(a[0].max(b[0])))
@@ -308,20 +332,7 @@ impl ComicTextDetector {
         let mut keep = contained.iter().map(|c| !c);
         accepted.retain(|_| keep.next().unwrap_or(true));
         for group in &mut accepted {
-            let vertical = group
-                .line_polygons
-                .iter()
-                .filter(|p| p[2][1] - p[0][1] > (p[2][0] - p[0][0]) * 3 / 2)
-                .count();
-            group.orientation = if (!group.line_polygons.is_empty()
-                && vertical * 2 > group.line_polygons.len())
-                || (group.line_polygons.is_empty()
-                    && group.bbox[3] - group.bbox[1] > (group.bbox[2] - group.bbox[0]) * 2)
-            {
-                Orientation::Vertical
-            } else {
-                Orientation::Horizontal
-            };
+            group.orientation = orientation(group.bbox, &group.line_polygons);
         }
         // Deterministic local order; panel ordering is intentionally not inferred.
         accepted.sort_by_key(|g| (g.bbox[1], std::cmp::Reverse(g.bbox[0])));
@@ -415,6 +426,26 @@ mod tests {
         let page = RgbImage::from_pixel(1654, 1170, image::Rgb([255, 255, 255]));
         let (_, w, h) = pixels(&page, &device, false).unwrap();
         assert_eq!((w, h), (1024, 724));
+    }
+    #[test]
+    fn squarish_lines_do_not_vote_on_direction() {
+        let rect = |x: u32, y: u32, w: u32, h: u32| polygon([x, y, x + w, y + h]);
+        // 「……／かう」: the dots' column is squarish, かう's tall.
+        let bubble = [rect(163, 130, 23, 29), rect(73, 133, 34, 58)];
+        assert_eq!(
+            orientation([73, 103, 186, 191], &bubble),
+            Orientation::Vertical
+        );
+        let caption = [rect(0, 0, 200, 30), rect(0, 40, 30, 30)];
+        assert_eq!(
+            orientation([0, 0, 200, 70], &caption),
+            Orientation::Horizontal
+        );
+        assert_eq!(orientation([0, 0, 30, 100], &[]), Orientation::Vertical);
+        assert_eq!(
+            orientation([0, 0, 30, 30], &[rect(0, 0, 30, 30)]),
+            Orientation::Horizontal
+        );
     }
     #[test]
     fn overlap_is_scale_independent() {
