@@ -1,9 +1,12 @@
 //! Native Rust Japanese manga recognition. Reuse [`MangaOcr`] on a worker thread.
 //! Recognize selections or detected page groups with native CPU/Metal/CUDA inference.
+mod blocks;
 mod detector;
 mod detector_graph;
 mod generation;
-pub use detector::{ComicTextDetector, DetectedGroup, DetectionOptions, Orientation};
+mod lines;
+pub use blocks::Language;
+pub use detector::{ComicTextDetector, DetectedGroup, DetectionOptions, Orientation, TextMask};
 mod model;
 mod preprocess;
 mod text;
@@ -409,6 +412,14 @@ pub trait PageDetector {
         image: &RgbImage,
         options: &DetectionOptions,
     ) -> Result<Vec<DetectedGroup>>;
+    /// `detect_page` with the text mask long lines are cut by, when the detector has one.
+    fn detect_page_with_mask(
+        &mut self,
+        image: &RgbImage,
+        options: &DetectionOptions,
+    ) -> Result<(Vec<DetectedGroup>, Option<TextMask>)> {
+        Ok((self.detect_page(image, options)?, None))
+    }
 }
 impl PageDetector for ComicTextDetector {
     fn detect_page(
@@ -418,6 +429,14 @@ impl PageDetector for ComicTextDetector {
     ) -> Result<Vec<DetectedGroup>> {
         self.detect_groups(image, options)
     }
+    fn detect_page_with_mask(
+        &mut self,
+        image: &RgbImage,
+        options: &DetectionOptions,
+    ) -> Result<(Vec<DetectedGroup>, Option<TextMask>)> {
+        let (groups, mask) = ComicTextDetector::detect_page_with_mask(self, image, options)?;
+        Ok((groups, Some(mask)))
+    }
 }
 
 /// A recognized page block. Geometry is in the original capture's pixel space.
@@ -426,8 +445,14 @@ pub struct PageGroup {
     pub id: String,
     pub bbox: BoundingBox,
     pub orientation: Orientation,
+    /// In reading order, one per entry of `lines`.
     pub line_polygons: Vec<[[u32; 2]; 4]>,
+    /// Each line's text, read on its own as mokuro reads it.
+    pub lines: Vec<String>,
+    /// The lines' mean thickness in page pixels (mokuro's `font_size`); zero when unknown.
+    pub font_size: f32,
     pub detection_confidence: f32,
+    /// The lines' text joined, with their tokens and score together.
     pub recognition: Recognition,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -446,7 +471,7 @@ impl MangaOcr {
         options.validate()?;
         preprocess::validate(image)?;
         detection.validate()?;
-        let regions = detector.detect_page(image, detection)?;
+        let (regions, mask) = detector.detect_page_with_mask(image, detection)?;
         if regions.len() > detection.max_regions {
             return Err(Error::InvalidInput(
                 "page detector exceeded region limit".into(),
@@ -468,24 +493,49 @@ impl MangaOcr {
         }
         let mut groups = Vec::with_capacity(regions.len());
         for (i, r) in regions.into_iter().enumerate() {
-            let [l, t, right, bottom] = r.bbox;
-            let padding = ((right - l).min(bottom - t) as f32 * 0.04).round().max(2.) as u32;
-            let x = l.saturating_sub(padding);
-            let y = t.saturating_sub(padding);
-            let end_x = right.saturating_add(padding).min(image.width());
-            let end_y = bottom.saturating_add(padding).min(image.height());
-            let crop = image::imageops::crop_imm(image, x, y, end_x - x, end_y - y).to_image();
-            let recognition = self.recognize(&crop, options)?;
-            if recognition.text.is_empty() {
+            let vertical = matches!(r.orientation, Orientation::Vertical);
+            // A detector that found no lines in a block reads the block as its one line.
+            let polygons = if r.line_polygons.is_empty() {
+                let [l, t, right, bottom] = r.bbox;
+                vec![[[l, t], [right, t], [right, bottom], [l, bottom]]]
+            } else {
+                r.line_polygons
+            };
+            let mut line_polygons = Vec::with_capacity(polygons.len());
+            let mut lines = Vec::with_capacity(polygons.len());
+            let mut parts = Vec::new();
+            for polygon in polygons {
+                let rect = [polygon[0][0], polygon[0][1], polygon[2][0], polygon[2][1]];
+                let mut text = String::new();
+                for chunk in lines::chunks(
+                    image,
+                    mask.as_ref(),
+                    rect,
+                    vertical,
+                    r.language,
+                    r.font_size,
+                ) {
+                    let recognition = self.recognize(&chunk, options)?;
+                    text.push_str(&recognition.text);
+                    parts.push(recognition);
+                }
+                if !text.is_empty() {
+                    line_polygons.push(polygon);
+                    lines.push(text);
+                }
+            }
+            if lines.is_empty() {
                 continue;
             }
             groups.push(PageGroup {
                 id: format!("block-{i}"),
                 bbox: r.bbox,
                 orientation: r.orientation,
-                line_polygons: r.line_polygons,
+                line_polygons,
+                lines,
+                font_size: r.font_size,
                 detection_confidence: r.confidence,
-                recognition,
+                recognition: joined(parts),
             });
         }
         let full_text = groups
@@ -533,6 +583,8 @@ impl MangaOcr {
                 Orientation::Horizontal
             },
             line_polygons: Vec::new(),
+            lines: vec![recognition.text.clone()],
+            font_size: 0.,
             // Not a detection: the detector found nothing here.
             detection_confidence: 0.,
             recognition,
@@ -542,6 +594,30 @@ impl MangaOcr {
             groups: vec![group],
         })
     }
+}
+
+/// Recognitions read in order as one: their text and tokens joined, their scores averaged
+/// over the tokens each scored.
+fn joined(parts: Vec<Recognition>) -> Recognition {
+    let mut out = Recognition {
+        text: String::new(),
+        token_ids: Vec::new(),
+        mean_log_probability: None,
+        truncated: false,
+    };
+    let (mut total, mut weight) = (0., 0.);
+    for p in parts {
+        out.text.push_str(&p.text);
+        let n = (p.token_ids.len() + 1) as f64;
+        if let Some(score) = p.mean_log_probability {
+            total += score * n;
+            weight += n;
+        }
+        out.token_ids.extend(p.token_ids);
+        out.truncated |= p.truncated;
+    }
+    out.mean_log_probability = (weight > 0.).then(|| total / weight);
+    out
 }
 
 /// Below this mean token log-probability a whole-image read is invented text; see

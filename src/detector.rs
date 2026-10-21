@@ -1,4 +1,5 @@
 //! Comic Text Detector page regions, executed natively with Candle.
+use crate::blocks::{self, Candidate, Language};
 use crate::detector_graph::DetectorGraph;
 use crate::{Backend, BackendInfo, BoundingBox, Detection, Error, Result, TextDetector};
 use candle_core::{Device, Tensor};
@@ -15,9 +16,14 @@ pub enum Orientation {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DetectedGroup {
     pub bbox: BoundingBox,
+    /// The YOLO block's; zero for a block made of lines no YOLO block took.
     pub confidence: f32,
     pub orientation: Orientation,
+    /// In reading order.
     pub line_polygons: Vec<[[u32; 2]; 4]>,
+    /// The lines' mean thickness in page pixels: mokuro's `font_size`.
+    pub font_size: f32,
+    pub language: Language,
 }
 #[derive(Debug, Clone)]
 pub struct DetectionOptions {
@@ -122,46 +128,10 @@ fn mapped(b: [f32; 4], image: &RgbImage, w: u32, h: u32) -> Option<BoundingBox> 
 fn polygon(b: BoundingBox) -> [[u32; 2]; 4] {
     [[b[0], b[1]], [b[2], b[1]], [b[2], b[3]], [b[0], b[3]]]
 }
-fn union(a: BoundingBox, b: BoundingBox) -> BoundingBox {
-    [
-        a[0].min(b[0]),
-        a[1].min(b[1]),
-        a[2].max(b[2]),
-        a[3].max(b[3]),
-    ]
-}
 /// Share of a block that must lie inside a larger one for it to count as a duplicate.
 const CONTAINED: f64 = 0.8;
 fn area(r: BoundingBox) -> u64 {
     u64::from(r[2] - r[0]) * u64::from(r[3] - r[1])
-}
-/// A block's writing direction, by its lines: those clearly taller than wide vote vertical, those
-/// clearly wider than tall horizontal. A squarish line (a column of two ellipses, one kana) says
-/// nothing, so 「……／かう」 is the column its かう is. With no vote, the block's own shape decides.
-fn orientation(bbox: BoundingBox, lines: &[[[u32; 2]; 4]]) -> Orientation {
-    vote(lines).unwrap_or(if bbox[3] - bbox[1] > (bbox[2] - bbox[0]) * 2 {
-        Orientation::Vertical
-    } else {
-        Orientation::Horizontal
-    })
-}
-/// The direction a block's lines vote for, or `None` when none is clearly long one way or the
-/// votes tie: a block of short text (……, んっ, one kana) whose direction its lines cannot show.
-fn vote(lines: &[[[u32; 2]; 4]]) -> Option<Orientation> {
-    let tall = |w: u32, h: u32| h > w * 3 / 2;
-    let vertical = lines
-        .iter()
-        .filter(|p| tall(p[2][0] - p[0][0], p[2][1] - p[0][1]))
-        .count();
-    let horizontal = lines
-        .iter()
-        .filter(|p| tall(p[2][1] - p[0][1], p[2][0] - p[0][0]))
-        .count();
-    match vertical.cmp(&horizontal) {
-        std::cmp::Ordering::Greater => Some(Orientation::Vertical),
-        std::cmp::Ordering::Less => Some(Orientation::Horizontal),
-        std::cmp::Ordering::Equal => None,
-    }
 }
 fn intersection_fraction(a: BoundingBox, b: BoundingBox) -> f64 {
     let area = f64::from(a[2] - a[0]) * f64::from(a[3] - a[1]);
@@ -178,7 +148,7 @@ fn lines(map: &[f32], threshold: f32, w: u32, h: u32) -> Vec<BoundingBox> {
     for y in 0..h as usize {
         for x in 0..w as usize {
             let start = y * SIZE + x;
-            if seen[start] || map[start] < threshold {
+            if seen[start] || map[start] <= threshold {
                 continue;
             }
             seen[start] = true;
@@ -205,29 +175,29 @@ fn lines(map: &[f32], threshold: f32, w: u32, h: u32) -> Vec<BoundingBox> {
                             continue;
                         }
                         let n = ny as usize * SIZE + nx as usize;
-                        if !seen[n] && map[n] >= threshold {
+                        if !seen[n] && map[n] > threshold {
                             seen[n] = true;
                             stack.push(n);
                         }
                     }
                 }
             }
-            if count >= 8
-                && score / count as f32 >= 0.6
-                && bounds[2] - bounds[0] >= 3
-                && bounds[3] - bounds[1] >= 3
-            {
-                // Expand the shrink map along both axes using an area/perimeter margin.
-                let bw = (bounds[2] - bounds[0]) as f32;
-                let bh = (bounds[3] - bounds[1]) as f32;
-                let p = (1.5 * bw * bh / (2. * (bw + bh))).ceil() as usize;
-                out.push([
-                    bounds[0].saturating_sub(p) as u32,
-                    bounds[1].saturating_sub(p) as u32,
-                    (bounds[2] + p).min(w as usize) as u32,
-                    (bounds[3] + p).min(h as usize) as u32,
-                ]);
+            // As the reference's `boxes_from_bitmap`: the contour runs through the outer pixels'
+            // centres, so the rectangle around it is a pixel short each way; it is grown by
+            // DBNet's unclip distance (area × 1.5 / perimeter) and kept when its short side is two
+            // pixels or more and the map is sure of it (mean above 0.6, `box_thresh`).
+            let bw = (bounds[2] - bounds[0] - 1) as f32;
+            let bh = (bounds[3] - bounds[1] - 1) as f32;
+            if bw.min(bh) < 2. || score / count as f32 <= 0.6 {
+                continue;
             }
+            let d = 1.5 * bw * bh / (2. * (bw + bh));
+            out.push([
+                (bounds[0] as f32 - d).round().max(0.) as u32,
+                (bounds[1] as f32 - d).round().max(0.) as u32,
+                ((bounds[2] - 1) as f32 + d).round().min(w as f32) as u32,
+                ((bounds[3] - 1) as f32 + d).round().min(h as f32) as u32,
+            ]);
         }
     }
     out
@@ -250,10 +220,23 @@ impl ComicTextDetector {
         image: &RgbImage,
         options: &DetectionOptions,
     ) -> Result<Vec<DetectedGroup>> {
+        Ok(self.detect_page_with_mask(image, options)?.0)
+    }
+
+    /// The page's blocks, grouped as mokuro groups them (see `blocks`), and the detector's
+    /// text mask, which mokuro cuts long lines with.
+    pub fn detect_page_with_mask(
+        &mut self,
+        image: &RgbImage,
+        options: &DetectionOptions,
+    ) -> Result<(Vec<DetectedGroup>, TextMask)> {
         options.validate()?;
         let (input, w, h) = pixels(image, &self.device, false)?;
         let output = self.graph.forward(input)?;
-        if output["blk"].dims() != [1, 64512, 7] || output["det"].dims() != [1, 2, SIZE, SIZE] {
+        if output["blk"].dims() != [1, 64512, 7]
+            || output["det"].dims() != [1, 2, SIZE, SIZE]
+            || output["seg"].dims() != [1, 1, SIZE, SIZE]
+        {
             return Err(Error::ModelContract(
                 "unexpected detector output shapes".into(),
             ));
@@ -266,6 +249,12 @@ impl ComicTextDetector {
                 if !score.is_finite() || score < options.confidence_threshold {
                     return None;
                 }
+                // The head's classes are the reference's LANG_LIST: English, then Japanese.
+                let language = if p[6] > p[5] {
+                    Language::Ja
+                } else {
+                    Language::Eng
+                };
                 mapped(
                     [
                         p[0] - p[2] / 2.,
@@ -277,57 +266,32 @@ impl ComicTextDetector {
                     w,
                     h,
                 )
-                .map(|b| (b, score))
+                .map(|b| (b, score, language))
             })
             .collect();
         boxes.sort_by(|a, b| b.1.total_cmp(&a.1));
-        let mut accepted: Vec<DetectedGroup> = Vec::new();
-        for (bbox, confidence) in boxes {
+        let mut accepted: Vec<(BoundingBox, f32, Language)> = Vec::new();
+        for candidate in boxes {
             if accepted
                 .iter()
-                .any(|g| iou(g.bbox, bbox) > f64::from(options.nms_threshold))
+                .any(|g| iou(g.0, candidate.0) > f64::from(options.nms_threshold))
             {
                 continue;
             }
-            accepted.push(DetectedGroup {
-                bbox,
-                confidence,
-                orientation: Orientation::Horizontal,
-                line_polygons: Vec::new(),
-            });
+            accepted.push(candidate);
             if accepted.len() == options.max_regions {
                 break;
             }
         }
-        let map = output["det"]
-            .narrow(1, 0, 1)?
-            .flatten_all()?
-            .to_vec1::<f32>()?;
-        for line in lines(&map, options.line_threshold, w, h) {
-            let Some(line) = mapped(line.map(|v| v as f32), image, w, h) else {
-                continue;
-            };
-            let best = accepted
-                .iter()
-                .enumerate()
-                .map(|(i, g)| (i, intersection_fraction(line, g.bbox)))
-                .filter(|(_, overlap)| *overlap >= 0.5)
-                .max_by(|a, b| a.1.total_cmp(&b.1));
-            if let Some((i, _)) = best {
-                accepted[i].line_polygons.push(polygon(line));
-                accepted[i].bbox = union(accepted[i].bbox, line);
-            }
-            // Unassociated DB components can be individual glyphs/artwork; block
-            // confidence is required before generating text to limit hallucinations.
-        }
         // A block lying almost wholly inside a larger one is the same text found twice
         // (non-maximum suppression compares overlap with the union, so it keeps a small
-        // box inside a big one); reading both would repeat the line.
+        // box inside a big one). The reference keeps it, and with no line of its own it is
+        // read again from its box, repeating the line; it is dropped here.
         let contained: Vec<bool> = (0..accepted.len())
             .map(|i| {
-                let a = accepted[i].bbox;
+                let a = accepted[i].0;
                 accepted.iter().enumerate().any(|(j, other)| {
-                    let b = other.bbox;
+                    let b = other.0;
                     let larger = area(b) > area(a) || (area(b) == area(a) && j < i);
                     j != i && larger && intersection_fraction(a, b) >= CONTAINED
                 })
@@ -335,30 +299,111 @@ impl ComicTextDetector {
             .collect();
         let mut keep = contained.iter().map(|c| !c);
         accepted.retain(|_| keep.next().unwrap_or(true));
-        // A block its own lines decide keeps that direction; the rest follow the page's majority,
-        // and only on a page with none decided does a block's own shape decide it.
-        let voted: Vec<_> = accepted.iter().map(|g| vote(&g.line_polygons)).collect();
-        let vertical = voted
+        let candidates: Vec<_> = accepted
             .iter()
-            .filter(|v| **v == Some(Orientation::Vertical))
-            .count();
-        let horizontal = voted
-            .iter()
-            .filter(|v| **v == Some(Orientation::Horizontal))
-            .count();
-        let page = (vertical != horizontal).then_some(if vertical > horizontal {
-            Orientation::Vertical
-        } else {
-            Orientation::Horizontal
-        });
-        for (group, voted) in accepted.iter_mut().zip(voted) {
-            group.orientation = voted
-                .or(page)
-                .unwrap_or_else(|| orientation(group.bbox, &group.line_polygons));
+            .map(|&(bbox, confidence, language)| Candidate {
+                bbox: bbox.map(f64::from),
+                confidence,
+                language,
+            })
+            .collect();
+        let map = output["det"]
+            .narrow(1, 0, 1)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let lines: Vec<_> = lines(&map, options.line_threshold, w, h)
+            .into_iter()
+            .filter_map(|line| {
+                // Scaled to the page and truncated, as the reference casts them.
+                let (sx, sy) = (
+                    f64::from(image.width()) / f64::from(w),
+                    f64::from(image.height()) / f64::from(h),
+                );
+                let r = [
+                    (f64::from(line[0]) * sx).trunc(),
+                    (f64::from(line[1]) * sy).trunc(),
+                    (f64::from(line[2]) * sx).trunc(),
+                    (f64::from(line[3]) * sy).trunc(),
+                ];
+                (r[0] < r[2] && r[1] < r[3]).then_some(r)
+            })
+            .collect();
+        let mask = TextMask {
+            values: output["seg"].flatten_all()?.to_vec1::<f32>()?,
+            scale_x: f64::from(w) / f64::from(image.width()),
+            scale_y: f64::from(h) / f64::from(image.height()),
+        };
+        let (im_w, im_h) = (f64::from(image.width()), f64::from(image.height()));
+        let groups = blocks::group(&candidates, &lines, im_w, im_h, |r| mask.mean(r))
+            .into_iter()
+            .take(options.max_regions)
+            .filter_map(|b| {
+                let clamp = |r: blocks::Rect| -> Option<BoundingBox> {
+                    let r = [
+                        r[0].clamp(0., im_w) as u32,
+                        r[1].clamp(0., im_h) as u32,
+                        r[2].clamp(0., im_w) as u32,
+                        r[3].clamp(0., im_h) as u32,
+                    ];
+                    (r[0] < r[2] && r[1] < r[3]).then_some(r)
+                };
+                let line_polygons: Vec<_> = b
+                    .lines
+                    .iter()
+                    .filter_map(|&l| clamp(l))
+                    .map(polygon)
+                    .collect();
+                Some(DetectedGroup {
+                    bbox: clamp(b.bbox)?,
+                    confidence: b.confidence,
+                    orientation: if b.vertical {
+                        Orientation::Vertical
+                    } else {
+                        Orientation::Horizontal
+                    },
+                    line_polygons,
+                    font_size: b.font_size as f32,
+                    language: b.language,
+                })
+            })
+            .filter(|g| !g.line_polygons.is_empty())
+            .collect();
+        Ok((groups, mask))
+    }
+}
+
+/// The detector's text mask (0 to 1), read in page pixels.
+pub struct TextMask {
+    values: Vec<f32>,
+    scale_x: f64,
+    scale_y: f64,
+}
+impl TextMask {
+    /// At a page pixel; outside the page, nothing.
+    pub fn at(&self, x: f64, y: f64) -> f32 {
+        let (mx, my) = ((x * self.scale_x).floor(), (y * self.scale_y).floor());
+        if mx < 0. || my < 0. || mx >= SIZE as f64 || my >= SIZE as f64 {
+            return 0.;
         }
-        // Deterministic local order; panel ordering is intentionally not inferred.
-        accepted.sort_by_key(|g| (g.bbox[1], std::cmp::Reverse(g.bbox[0])));
-        Ok(accepted)
+        self.values[my as usize * SIZE + mx as usize]
+    }
+    /// Mean over a rectangle of page pixels.
+    pub(crate) fn mean(&self, r: blocks::Rect) -> f64 {
+        let x0 = (r[0] * self.scale_x).floor().max(0.) as usize;
+        let y0 = (r[1] * self.scale_y).floor().max(0.) as usize;
+        let x1 = ((r[2] * self.scale_x).ceil() as usize)
+            .min(SIZE)
+            .max(x0 + 1);
+        let y1 = ((r[3] * self.scale_y).ceil() as usize)
+            .min(SIZE)
+            .max(y0 + 1);
+        let mut sum = 0.;
+        for y in y0..y1.min(SIZE) {
+            for x in x0..x1 {
+                sum += f64::from(self.values[y * SIZE + x]);
+            }
+        }
+        sum / ((x1 - x0) * (y1 - y0)) as f64
     }
 }
 impl TextDetector for ComicTextDetector {
@@ -448,29 +493,6 @@ mod tests {
         let page = RgbImage::from_pixel(1654, 1170, image::Rgb([255, 255, 255]));
         let (_, w, h) = pixels(&page, &device, false).unwrap();
         assert_eq!((w, h), (1024, 724));
-    }
-    #[test]
-    fn squarish_lines_do_not_vote_on_direction() {
-        let rect = |x: u32, y: u32, w: u32, h: u32| polygon([x, y, x + w, y + h]);
-        // 「……／かう」: the dots' column is squarish, かう's tall.
-        let bubble = [rect(163, 130, 23, 29), rect(73, 133, 34, 58)];
-        assert_eq!(
-            orientation([73, 103, 186, 191], &bubble),
-            Orientation::Vertical
-        );
-        let caption = [rect(0, 0, 200, 30), rect(0, 40, 30, 30)];
-        assert_eq!(
-            orientation([0, 0, 200, 70], &caption),
-            Orientation::Horizontal
-        );
-        assert_eq!(orientation([0, 0, 30, 100], &[]), Orientation::Vertical);
-        assert_eq!(
-            orientation([0, 0, 30, 30], &[rect(0, 0, 30, 30)]),
-            Orientation::Horizontal
-        );
-        // A squarish block's lines cannot say; on a page it follows the decided blocks.
-        assert_eq!(vote(&[rect(0, 0, 30, 30)]), None);
-        assert_eq!(vote(&bubble), Some(Orientation::Vertical));
     }
     #[test]
     fn overlap_is_scale_independent() {

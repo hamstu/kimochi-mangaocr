@@ -27,11 +27,15 @@ fn full_page_preserves_independent_text_groups() {
             &DetectionOptions::default(),
         )
         .unwrap();
-    assert!(
-        page.groups.len() >= 12 && page.groups.len() <= 18,
-        "{} blocks",
-        page.groups.len()
-    );
+    // The detector's blocks, and, as mokuro reads them, blocks of the lines no block took: the
+    // page's margin notes, set in type too small for the block head to find.
+    let detected = page
+        .groups
+        .iter()
+        .filter(|g| g.detection_confidence > 0.)
+        .count();
+    assert!((12..=18).contains(&detected), "{detected} detected blocks");
+    assert!(page.groups.len() <= 24, "{} blocks", page.groups.len());
     assert!(
         page.groups
             .iter()
@@ -51,6 +55,8 @@ fn full_page_preserves_independent_text_groups() {
         let [l, t, r, b] = group.bbox;
         assert!(l < r && t < b && r <= image.width() && b <= image.height());
         assert!(!group.recognition.text.trim().is_empty());
+        assert_eq!(group.lines.len(), group.line_polygons.len());
+        assert_eq!(group.lines.concat(), group.recognition.text);
         assert!(!group.recognition.truncated);
     }
 }
