@@ -924,6 +924,7 @@ dependencies = [
  "image",
  "jpeg-decoder",
  "prost",
+ "rayon",
  "serde",
  "serde_json",
  "sha2",
