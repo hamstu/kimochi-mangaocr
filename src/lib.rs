@@ -323,7 +323,8 @@ impl MangaOcr {
     }
     /// `recognize` for each image, in order. The encoder takes up to [`ENCODE_BATCH`] of them in
     /// one pass: one image's 197 tokens make matrix products too small to spread over a CPU's
-    /// cores, and a page reads dozens of line crops.
+    /// cores, and a page reads dozens of line crops. Their searches then step through the
+    /// decoder together, [`DECODE_IMAGES`] at most.
     pub fn recognize_all(
         &mut self,
         images: &[RgbImage],
@@ -347,19 +348,20 @@ impl MangaOcr {
                 pending.push(i);
             }
         }
-        for batch in pending.chunks(ENCODE_BATCH) {
-            let pixels = batch
-                .iter()
-                .map(|&i| preprocess::pixels(&images[i], &self.device))
+        for group in pending.chunks(DECODE_IMAGES) {
+            let encoded = group
+                .chunks(ENCODE_BATCH)
+                .map(|batch| {
+                    let pixels = batch
+                        .iter()
+                        .map(|&i| preprocess::pixels(&images[i], &self.device))
+                        .collect::<Result<Vec<_>>>()?;
+                    Ok(self.model.encode(&Tensor::cat(&pixels, 0)?)?)
+                })
                 .collect::<Result<Vec<_>>>()?;
-            let encoded = self.model.encode(&Tensor::cat(&pixels, 0)?)?;
-            for (j, &i) in batch.iter().enumerate() {
-                let h = generation::generate(
-                    &self.model,
-                    &encoded.narrow(0, j, 1)?,
-                    &self.device,
-                    options,
-                )?;
+            let encoded = Tensor::cat(&encoded, 0)?;
+            let found = generation::generate(&self.model, &encoded, &self.device, options)?;
+            for (&i, h) in group.iter().zip(found) {
                 out[i] = Some(finish(h, &self.vocab));
             }
         }
@@ -722,6 +724,9 @@ fn joined(parts: Vec<Recognition>) -> Recognition {
 /// The most line crops the recognizer's encoder takes in one pass; see
 /// [`MangaOcr::recognize_all`].
 pub const ENCODE_BATCH: usize = 8;
+/// The most line crops whose searches step through the decoder together: a page's lines go
+/// through in one, so the decode takes as many steps as its longest line.
+pub const DECODE_IMAGES: usize = 128;
 
 /// Below this mean token log-probability a whole-image read is invented text; see
 /// `MangaOcr::recognize_region`.

@@ -143,26 +143,92 @@ impl Beams {
             .ok_or_else(|| Error::ModelContract("empty generation".into()))
     }
 }
+/// Every image's search at once, their beams stepping through the decoder together, for
+/// `encoded`, `[n, 197, 768]`. Images leave the batch a few at a time as they finish (see
+/// `onnx::OnnxReader::decode`, which steps the same way).
 pub(crate) fn generate(
     model: &Model,
     encoded: &Tensor,
     device: &Device,
     options: &OcrOptions,
-) -> Result<Hypothesis> {
-    let mut state = model.start(encoded)?;
-    let mut beams = Beams::new(options.beam_width);
+) -> Result<Vec<Hypothesis>> {
+    use rayon::prelude::*;
+    use std::collections::HashMap;
+    let w = options.beam_width;
+    let images = encoded.dim(0)?;
+    let mut state = model.start(encoded, w)?;
+    let mut beams: Vec<_> = (0..images).map(|_| Beams::new(w)).collect();
+    let mut done = vec![false; images];
+    // The images in the batch, in row order: image `active[i]` owns rows `i·w..(i+1)·w`.
+    let mut active: Vec<usize> = (0..images).collect();
     for _ in 0..options.max_new_tokens {
-        let ids = Tensor::new(beams.tokens(), device)?.unsqueeze(1)?;
+        let mut ids = Vec::with_capacity(active.len() * w);
+        for &j in &active {
+            if done[j] {
+                ids.extend(std::iter::repeat_n(3u32, w));
+            } else {
+                ids.extend(beams[j].tokens());
+            }
+        }
+        let ids = Tensor::new(ids, device)?.unsqueeze(1)?;
         let scores = model
             .step(&ids, &mut state)?
             .flatten_all()?
             .to_vec1::<f32>()?;
-        match beams.advance(&scores, options)? {
-            Some(parents) => state.reorder(&Tensor::new(parents, device)?)?,
-            None => break,
+        let width = w * 6144;
+        let row_of: HashMap<usize, usize> = active
+            .iter()
+            .enumerate()
+            .filter(|&(_, &j)| !done[j])
+            .map(|(i, &j)| (j, i))
+            .collect();
+        let advanced: Vec<(usize, Option<Vec<u32>>)> = beams
+            .par_iter_mut()
+            .enumerate()
+            .filter_map(|(j, b)| row_of.get(&j).map(|&i| (j, i, b)))
+            .map(|(j, i, b)| Ok((j, b.advance(&scores[i * width..(i + 1) * width], options)?)))
+            .collect::<Result<_>>()?;
+        let mut parents: HashMap<usize, Vec<u32>> = HashMap::new();
+        for (j, p) in advanced {
+            match p {
+                Some(p) => {
+                    parents.insert(j, p);
+                }
+                None => done[j] = true,
+            }
+        }
+        if done.iter().all(|&d| d) {
+            break;
+        }
+        // Finished images leave once a quarter of the batch has finished.
+        let live = active.iter().filter(|&&j| !done[j]).count();
+        let keep: Vec<usize> = if live * 4 <= active.len() * 3 {
+            active.iter().copied().filter(|&j| !done[j]).collect()
+        } else {
+            active.clone()
+        };
+        let mut next = Vec::with_capacity(keep.len() * w);
+        let mut kept_rows = Vec::with_capacity(keep.len());
+        for &j in &keep {
+            let row = active
+                .iter()
+                .position(|&a| a == j)
+                .expect("kept image is active");
+            kept_rows.push(row as u32);
+            let base = (row * w) as u32;
+            match parents.get(&j) {
+                Some(p) => next.extend(p.iter().map(|&p| base + p)),
+                // A finished image not yet dropped keeps its rows, stepping on EOS.
+                None => next.extend((0..w as u32).map(|k| base + k)),
+            }
+        }
+        state.reorder(&Tensor::new(next, device)?)?;
+        if keep.len() != active.len() {
+            state.keep_images(&Tensor::new(kept_rows, device)?)?;
+            active = keep;
         }
     }
-    beams.best(options)
+    beams.into_iter().map(|b| b.best(options)).collect()
 }
 #[cfg(test)]
 mod tests {

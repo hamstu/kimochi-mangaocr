@@ -19,7 +19,8 @@ impl Kv {
         })
     }
 }
-/// Cross-attention keys, transposed, and values of one image: every beam reads the same.
+/// Cross-attention keys, transposed, and values, one row per image: every beam of an image
+/// reads its image's.
 pub(crate) struct Shared {
     kt: Tensor,
     v: Tensor,
@@ -54,22 +55,21 @@ impl Attention {
             v: kv.v,
         })
     }
-    /// One query token per beam against one image: the beams stand in for the query rows of a
-    /// single product per head, instead of a one-row product per beam and head.
-    fn attend_shared(&self, x: &Tensor, kv: &Shared) -> R<Tensor> {
+    /// One query token per beam, rows image-major (`beams` per image), against each beam's
+    /// image: an image's beams stand in for the query rows of one product per image and head,
+    /// instead of a one-row product per beam and head.
+    fn attend_shared(&self, x: &Tensor, kv: &Shared, beams: usize) -> R<Tensor> {
         let (b, s, _) = x.dims3()?;
         let q = self
             .q
             .forward(x)?
-            .reshape((b * s, HEADS, DIM))?
-            .transpose(0, 1)?
-            .contiguous()?
-            .unsqueeze(0)?;
+            .reshape((b / beams, beams * s, HEADS, DIM))?
+            .transpose(1, 2)?
+            .contiguous()?;
         let scores = (q.matmul(&kv.kt)? / (DIM as f64).sqrt())?;
         candle_nn::ops::softmax_last_dim(&scores)?
             .matmul(&kv.v)?
-            .squeeze(0)?
-            .transpose(0, 1)?
+            .transpose(1, 2)?
             .contiguous()?
             .reshape((b, s, H))
     }
@@ -141,9 +141,12 @@ impl BertAttention {
         self.norm
             .forward(&(x + self.projection.forward(&self.attn.attend(x, kv)?)?)?)
     }
-    fn forward_shared(&self, x: &Tensor, kv: &Shared) -> R<Tensor> {
-        self.norm
-            .forward(&(x + self.projection.forward(&self.attn.attend_shared(x, kv)?)?)?)
+    fn forward_shared(&self, x: &Tensor, kv: &Shared, beams: usize) -> R<Tensor> {
+        self.norm.forward(
+            &(x + self
+                .projection
+                .forward(&self.attn.attend_shared(x, kv, beams)?)?)?,
+        )
     }
 }
 struct BertLayer {
@@ -161,7 +164,7 @@ impl BertLayer {
             ff: FeedForward::load(vb)?,
         })
     }
-    fn step(&self, x: &Tensor, cache: &mut Option<Kv>, cross: &Shared) -> R<Tensor> {
+    fn step(&self, x: &Tensor, cache: &mut Option<Kv>, cross: &Shared, beams: usize) -> R<Tensor> {
         let next = self.self_attn.attn.kv(x)?;
         let kv = match cache.as_ref() {
             None => next,
@@ -172,7 +175,7 @@ impl BertLayer {
         };
         let x = self.self_attn.forward(x, &kv)?;
         *cache = Some(kv);
-        let x = self.cross.forward_shared(&x, cross)?;
+        let x = self.cross.forward_shared(&x, cross, beams)?;
         self.norm.forward(&(&x + self.ff.forward(&x)?)?)
     }
 }
@@ -191,20 +194,31 @@ pub(crate) struct Model {
     lm_norm: LayerNorm,
     lm_output: Linear,
 }
+/// A decode of several images at once, `beams` rows per image, image-major.
 pub(crate) struct DecodeState {
     caches: Vec<Option<Kv>>,
     cross: Vec<Shared>,
+    beams: usize,
     pub position: usize,
 }
 impl DecodeState {
+    /// The cache rows each next row continues, as indices into this step's rows.
     pub fn reorder(&mut self, indices: &Tensor) -> R<()> {
         self.caches = self
             .caches
             .iter()
             .map(|x| x.as_ref().map(|v| v.select(indices)).transpose())
             .collect::<R<_>>()?;
-        // Every beam belongs to the same image: the cross-attention KV is held once for all
-        // of them and never needs reordering.
+        // The cross-attention KV is held once per image and follows the images, not the beams.
+        Ok(())
+    }
+    /// Keeps only `images` (indices into the current images) of the cross-attention KV; the
+    /// cache follows through `reorder`.
+    pub fn keep_images(&mut self, images: &Tensor) -> R<()> {
+        for c in &mut self.cross {
+            c.kt = c.kt.index_select(images, 0)?;
+            c.v = c.v.index_select(images, 0)?;
+        }
         Ok(())
     }
 }
@@ -271,8 +285,8 @@ impl Model {
         }
         self.vit_norm.forward(&x)
     }
-    /// A fresh decode of one image's hidden states, `[1, 197, 768]`.
-    pub fn start(&self, encoded: &Tensor) -> R<DecodeState> {
+    /// A fresh decode of images' hidden states, `[n, 197, 768]`, `beams` rows each.
+    pub fn start(&self, encoded: &Tensor, beams: usize) -> R<DecodeState> {
         let cross = self
             .bert
             .iter()
@@ -281,6 +295,7 @@ impl Model {
         Ok(DecodeState {
             caches: vec![None; self.bert.len()],
             cross,
+            beams,
             position: 0,
         })
     }
@@ -293,7 +308,7 @@ impl Model {
                 + self.token_types.forward(&types)?)?,
         )?;
         for (i, l) in self.bert.iter().enumerate() {
-            x = l.step(&x, &mut state.caches[i], &state.cross[i])?;
+            x = l.step(&x, &mut state.caches[i], &state.cross[i], state.beams)?;
         }
         state.position += 1;
         candle_nn::ops::log_softmax(
