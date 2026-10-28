@@ -152,25 +152,29 @@ impl OnnxReader {
         })
     }
     /// Every line's search, its beams stepping through the decoder with all the others'.
+    ///
+    /// `cross` holds each line's encoder keys and values (`CROSS` order, lines in a row). Lines
+    /// leave the batch as they finish, a few at a time: their cache rows drop out through the
+    /// step's own reordering, and the remaining lines' keys and values are bound again.
     fn decode(
         &mut self,
-        cross: &[DynValue],
+        cross: &[Vec<f32>; 4],
         lines: usize,
         options: &OcrOptions,
     ) -> Result<Vec<Hypothesis>> {
         let w = self.beams;
-        let rows = lines * w;
         let mut beams: Vec<_> = (0..lines).map(|_| Beams::new(w)).collect();
-        // The encoder's keys and values are copied to the device once and read by every step;
-        // the cache stays where the step leaves it. Only token ids, parents and the
+        let mut done = vec![false; lines];
+        // The lines in the batch, in row order: line `active[i]` owns rows `i·w..(i+1)·w`.
+        let mut active: Vec<usize> = (0..lines).collect();
+        // The encoder's keys and values are copied to the device when bound and read by every
+        // step; the cache stays where the step leaves it. Only token ids, parents and the
         // log-probabilities cross between host and device each step.
         let mut binding = self.step.create_binding()?;
-        for (name, value) in ["ck0", "cv0", "ck1", "cv1"].into_iter().zip(cross) {
-            binding.bind_input(name, value)?;
-        }
+        bind_cross(&mut binding, cross, &active)?;
         let cache = self.cache_memory()?;
         let host = host_memory()?;
-        let mut done = vec![false; lines];
+        let rows = lines * w;
         // One masked slot of zeros stands for the empty cache.
         let mut past = (0..2 * graphs::LAYERS)
             .map(|_| {
@@ -181,12 +185,13 @@ impl OnnxReader {
         let mut mask = vec![-1e9f32];
         for step in 0..options.max_new_tokens {
             mask.push(0.);
+            let rows = active.len() * w;
             let mut ids = Vec::with_capacity(rows);
-            for (j, b) in beams.iter().enumerate() {
+            for &j in &active {
                 if done[j] {
                     ids.extend(std::iter::repeat_n(3i64, w));
                 } else {
-                    ids.extend(b.tokens().into_iter().map(i64::from));
+                    ids.extend(beams[j].tokens().into_iter().map(i64::from));
                 }
             }
             binding.bind_input("ids", &Tensor::from_array(([rows, 1], ids))?)?;
@@ -204,32 +209,32 @@ impl OnnxReader {
             let mut out = self.step.run_binding(&binding)?;
             let (_, logp) = out["logp"].try_extract_tensor::<f32>()?;
             let width = w * 6144;
-            // Each line's search is independent of the others'.
-            let advanced = beams
+            // Each line's search is independent of the others'. `row_of`: the stepping lines'
+            // places in the batch.
+            let row_of: std::collections::HashMap<usize, usize> = active
+                .iter()
+                .enumerate()
+                .filter(|&(_, &j)| !done[j])
+                .map(|(i, &j)| (j, i))
+                .collect();
+            let advanced: Vec<(usize, Option<Vec<u32>>)> = beams
                 .par_iter_mut()
                 .enumerate()
-                .map(|(j, b)| {
-                    if done[j] {
-                        return Ok(None);
+                .filter_map(|(j, b)| row_of.get(&j).map(|&i| (j, i, b)))
+                .map(|(j, i, b)| Ok((j, b.advance(&logp[i * width..(i + 1) * width], options)?)))
+                .collect::<Result<_>>()?;
+            let mut parents: std::collections::HashMap<usize, Vec<u32>> = Default::default();
+            for (j, p) in advanced {
+                match p {
+                    Some(p) => {
+                        parents.insert(j, p);
                     }
-                    b.advance(&logp[j * width..(j + 1) * width], options)
-                        .map(|parents| Some(parents.ok_or(())))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let mut next = Vec::with_capacity(rows);
-            for (j, advanced) in advanced.into_iter().enumerate() {
-                match advanced {
-                    Some(Ok(parents)) => {
-                        next.extend(parents.into_iter().map(|p| (j * w) as i64 + i64::from(p)));
-                        continue;
-                    }
-                    Some(Err(())) => done[j] = true,
-                    None => {}
+                    None => done[j] = true,
                 }
-                // A finished line keeps its rows, stepping on EOS, until every line is done.
-                next.extend((0..w).map(|k| (j * w + k) as i64));
             }
-            parent = next;
+            if done.iter().all(|&d| d) {
+                break;
+            }
             past = ["nk0", "nv0", "nk1", "nv1"]
                 .into_iter()
                 .map(|k| {
@@ -237,12 +242,62 @@ impl OnnxReader {
                         .ok_or_else(|| Error::ModelContract(format!("missing step output {k}")))
                 })
                 .collect::<Result<_>>()?;
-            if done.iter().all(|&d| d) {
-                break;
+            drop(out);
+            // Drop finished lines once a quarter of the batch has finished: each drop binds the
+            // remaining lines' keys and values again, so it is done a few times, not per line.
+            let live = active.iter().filter(|&&j| !done[j]).count();
+            let keep: Vec<usize> = if live * 4 <= active.len() * 3 {
+                active.iter().copied().filter(|&j| !done[j]).collect()
+            } else {
+                active.clone()
+            };
+            let mut next = Vec::with_capacity(keep.len() * w);
+            for &j in &keep {
+                // Rows index the cache this step wrote, in the old row order.
+                let row = active
+                    .iter()
+                    .position(|&a| a == j)
+                    .expect("kept line is active");
+                let base = (row * w) as i64;
+                match parents.get(&j) {
+                    Some(p) => next.extend(p.iter().map(|&p| base + i64::from(p))),
+                    // A finished line not yet dropped keeps its rows, stepping on EOS.
+                    None => next.extend((0..w as i64).map(|k| base + k)),
+                }
             }
+            if keep.len() != active.len() {
+                bind_cross(&mut binding, cross, &keep)?;
+                active = keep;
+            }
+            parent = next;
         }
         beams.into_iter().map(|b| b.best(options)).collect()
     }
+}
+
+/// The encoder outputs the step reads: name and per-line shape, in `cross` order.
+const CROSS: [(&str, [usize; 3]); 4] = [
+    ("ck0", [12, 64, 197]),
+    ("cv0", [12, 197, 64]),
+    ("ck1", [12, 64, 197]),
+    ("cv1", [12, 197, 64]),
+];
+
+/// Binds the keys and values of `lines` (indices into `cross`'s lines) as the step's inputs.
+fn bind_cross(
+    binding: &mut ort::io_binding::IoBinding,
+    cross: &[Vec<f32>; 4],
+    lines: &[usize],
+) -> Result<()> {
+    for (all, (name, [a, b, c])) in cross.iter().zip(CROSS) {
+        let per = a * b * c;
+        let mut data = Vec::with_capacity(lines.len() * per);
+        for &j in lines {
+            data.extend_from_slice(&all[j * per..(j + 1) * per]);
+        }
+        binding.bind_input(name, &Tensor::from_array(([lines.len(), a, b, c], data))?)?;
+    }
+    Ok(())
 }
 impl LineReader for OnnxReader {
     fn read_lines(&mut self, crops: &[RgbImage], options: &OcrOptions) -> Result<Vec<Recognition>> {
@@ -270,12 +325,6 @@ impl LineReader for OnnxReader {
                 pending.push(i);
             }
         }
-        const CROSS: [(&str, [usize; 3]); 4] = [
-            ("ck0", [12, 64, 197]),
-            ("cv0", [12, 197, 64]),
-            ("ck1", [12, 64, 197]),
-            ("cv1", [12, 197, 64]),
-        ];
         for group in pending.chunks(DECODE_LINES) {
             // Encoded in batches, their keys and values gathered for one decode.
             let mut cross: [Vec<f32>; 4] = Default::default();
@@ -290,13 +339,6 @@ impl LineReader for OnnxReader {
                     all.extend_from_slice(encoded[name].try_extract_tensor::<f32>()?.1);
                 }
             }
-            let cross = cross
-                .into_iter()
-                .zip(CROSS)
-                .map(|(data, (_, [a, b, c]))| {
-                    Ok(Tensor::from_array(([group.len(), a, b, c], data))?.into_dyn())
-                })
-                .collect::<Result<Vec<_>>>()?;
             for (&i, h) in group.iter().zip(self.decode(&cross, group.len(), options)?) {
                 out[i] = Some(finish(h, &self.vocab));
             }
