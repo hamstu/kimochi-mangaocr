@@ -198,6 +198,7 @@ impl DetectorGraph {
         })
     }
     pub fn forward(&self, input: Tensor) -> Result<HashMap<String, Tensor>> {
+        let _flush = matches!(input.device(), Device::Cpu).then(FlushDenormals::new);
         let mut values = self.weights.clone();
         values.insert("images".into(), input);
         let mut uses = self.uses.clone();
@@ -567,4 +568,66 @@ fn conv_cpu(
         (batch, c_out, out_h, out_w),
         x.device(),
     )?)
+}
+
+/// Subnormal floats flushed to zero (x86's FTZ and DAZ) on this thread and every thread of
+/// rayon's global pool, Candle's and gemm's workers, for the guard's lifetime; each thread's
+/// own setting comes back on drop.
+///
+/// The detector reads a snip on a 1024 square that is mostly black padding, and its
+/// activations there decay through LeakyReLU, SiLU and sigmoid tails into subnormals. x86
+/// cores take a microcode assist on every subnormal operand, around a hundred times the
+/// cost of a normal one: on an i7-7700K a 690×240 snip's detection took 27.6 s, and 2.9 s
+/// flushed. Apple's cores handle subnormals at full speed, which is why no Mac showed it.
+/// Values below 1.2e-38 cannot move a detection.
+struct FlushDenormals {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    saved: (u32, Vec<u32>),
+}
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+mod mxcsr {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86 as arch;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64 as arch;
+    /// Flush-to-zero (bit 15) and denormals-are-zero (bit 6).
+    const FLUSH: u32 = 0x8040;
+    /// Sets FTZ and DAZ on the calling thread, answering its previous MXCSR.
+    pub fn flush() -> u32 {
+        // SSE is in the baseline of every x86-64 target. `_mm_setcsr` is deprecated only in
+        // favour of inline assembly, for code that relies on the compiler's ordering of
+        // floating-point operations around it; nothing here does.
+        #[allow(deprecated)]
+        unsafe {
+            let previous = arch::_mm_getcsr();
+            arch::_mm_setcsr(previous | FLUSH);
+            previous
+        }
+    }
+    pub fn restore(previous: u32) {
+        #[allow(deprecated)]
+        unsafe {
+            arch::_mm_setcsr(previous)
+        }
+    }
+}
+impl FlushDenormals {
+    fn new() -> Self {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        return Self {
+            saved: (mxcsr::flush(), rayon::broadcast(|_| mxcsr::flush())),
+        };
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        Self {}
+    }
+}
+impl Drop for FlushDenormals {
+    fn drop(&mut self) {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            let (own, pool) = &self.saved;
+            rayon::broadcast(|context| mxcsr::restore(pool[context.index()]));
+            mxcsr::restore(*own);
+        }
+    }
 }
