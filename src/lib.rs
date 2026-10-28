@@ -351,14 +351,7 @@ impl MangaOcr {
                     &self.device,
                     options,
                 )?;
-                let mean_log_probability = Some(h.score / (h.ids.len() - 1) as f64);
-                let ids: Vec<_> = h.ids.into_iter().skip(1).filter(|&x| x != 3).collect();
-                out[i] = Some(Recognition {
-                    text: post_process(&text::decode(&ids, &self.vocab)),
-                    token_ids: ids,
-                    mean_log_probability,
-                    truncated: !h.ended,
-                });
+                out[i] = Some(finish(h, &self.vocab));
             }
         }
         Ok(out.into_iter().flatten().collect())
@@ -505,107 +498,9 @@ impl MangaOcr {
         options: &OcrOptions,
         detection: &DetectionOptions,
     ) -> Result<PageResult> {
-        options.validate()?;
-        preprocess::validate(image)?;
-        detection.validate()?;
-        let (regions, mask) = detector.detect_page_with_mask(image, detection)?;
-        if regions.len() > detection.max_regions {
-            return Err(Error::InvalidInput(
-                "page detector exceeded region limit".into(),
-            ));
-        }
-        for r in &regions {
-            let [l, t, right, bottom] = r.bbox;
-            if l >= right
-                || t >= bottom
-                || right > image.width()
-                || bottom > image.height()
-                || !r.confidence.is_finite()
-            {
-                return Err(Error::InvalidInput(format!(
-                    "invalid detected page region: {:?}",
-                    r.bbox
-                )));
-            }
-        }
-        // Every line's crops are cut first and read together, so the encoder can batch them.
-        let mut crops = Vec::new();
-        let mut blocks = Vec::with_capacity(regions.len());
-        for r in regions {
-            let vertical = matches!(r.orientation, Orientation::Vertical);
-            // A detector that found no lines in a block reads the block as its one line.
-            let polygons = if r.line_polygons.is_empty() {
-                let [l, t, right, bottom] = r.bbox;
-                vec![[[l, t], [right, t], [right, bottom], [l, bottom]]]
-            } else {
-                r.line_polygons.clone()
-            };
-            let polygons: Vec<_> = polygons
-                .into_iter()
-                .map(|polygon| {
-                    let rect = [polygon[0][0], polygon[0][1], polygon[2][0], polygon[2][1]];
-                    let first = crops.len();
-                    crops.extend(lines::chunks(
-                        image,
-                        mask.as_ref(),
-                        rect,
-                        vertical,
-                        r.language,
-                        r.font_size,
-                    ));
-                    (polygon, first..crops.len())
-                })
-                .collect();
-            blocks.push((r, polygons));
-        }
-        let mut recognitions = self.recognize_all(&crops, options)?.into_iter();
-        let mut groups = Vec::with_capacity(blocks.len());
-        for (i, (r, polygons)) in blocks.into_iter().enumerate() {
-            let mut line_polygons = Vec::with_capacity(polygons.len());
-            let mut lines = Vec::with_capacity(polygons.len());
-            let mut parts = Vec::new();
-            for (polygon, chunks) in polygons {
-                let mut text = String::new();
-                for recognition in recognitions.by_ref().take(chunks.len()) {
-                    text.push_str(&recognition.text);
-                    parts.push(recognition);
-                }
-                if !text.is_empty() {
-                    line_polygons.push(polygon);
-                    lines.push(text);
-                }
-            }
-            if lines.is_empty() {
-                continue;
-            }
-            groups.push(PageGroup {
-                id: format!("block-{i}"),
-                bbox: r.bbox,
-                orientation: r.orientation,
-                line_polygons,
-                lines,
-                font_size: r.font_size,
-                detection_confidence: r.confidence,
-                recognition: joined(parts),
-            });
-        }
-        let full_text = groups
-            .iter()
-            .map(|g| g.recognition.text.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-        Ok(PageResult { groups, full_text })
+        read_page(self, image, detector, options, detection)
     }
-
-    /// `recognize_page` for an image that may be a whole page or a snip of a few words.
-    ///
-    /// The detector needs the context of a page around text to call it text, and a snip
-    /// drawn tight around one line (a sound effect, a single caption) can give it none: it
-    /// finds no block. Manga OCR itself was trained on exactly such crops, so when the
-    /// detector comes back empty the whole image is read as one block, and kept only if
-    /// the model is sure of it. Real text reads at a mean token log-probability near zero
-    /// (-0.003 to -0.11 on the upstream corpus and snips of whole bubbles); a page, or
-    /// artwork, read as one block is invented text below -0.7.
+    /// `recognize_page` for an image that may be a whole page or a snip; see [`read_region`].
     pub fn recognize_region<D: PageDetector + ?Sized>(
         &mut self,
         image: &RgbImage,
@@ -613,37 +508,181 @@ impl MangaOcr {
         options: &OcrOptions,
         detection: &DetectionOptions,
     ) -> Result<PageResult> {
-        let page = self.recognize_page(image, detector, options, detection)?;
-        if !page.groups.is_empty() {
-            return Ok(page);
+        read_region(self, image, detector, options, detection)
+    }
+}
+
+/// A page's detected blocks, each line read on its own as mokuro reads it.
+pub fn read_page<R: LineReader + ?Sized, D: PageDetector + ?Sized>(
+    reader: &mut R,
+    image: &RgbImage,
+    detector: &mut D,
+    options: &OcrOptions,
+    detection: &DetectionOptions,
+) -> Result<PageResult> {
+    options.validate()?;
+    preprocess::validate(image)?;
+    detection.validate()?;
+    let (regions, mask) = detector.detect_page_with_mask(image, detection)?;
+    if regions.len() > detection.max_regions {
+        return Err(Error::InvalidInput(
+            "page detector exceeded region limit".into(),
+        ));
+    }
+    for r in &regions {
+        let [l, t, right, bottom] = r.bbox;
+        if l >= right
+            || t >= bottom
+            || right > image.width()
+            || bottom > image.height()
+            || !r.confidence.is_finite()
+        {
+            return Err(Error::InvalidInput(format!(
+                "invalid detected page region: {:?}",
+                r.bbox
+            )));
         }
-        let recognition = self.recognize(image, options)?;
-        let sure = recognition
-            .mean_log_probability
-            .is_some_and(|p| p >= WHOLE_IMAGE_MIN_LOG_PROBABILITY);
-        if recognition.text.is_empty() || !sure || recognition.truncated {
-            return Ok(page);
-        }
-        let (width, height) = image.dimensions();
-        let group = PageGroup {
-            id: "block-0".into(),
-            bbox: [0, 0, width, height],
-            orientation: if height > width {
-                Orientation::Vertical
-            } else {
-                Orientation::Horizontal
-            },
-            line_polygons: Vec::new(),
-            lines: vec![recognition.text.clone()],
-            font_size: 0.,
-            // Not a detection: the detector found nothing here.
-            detection_confidence: 0.,
-            recognition,
+    }
+    // Every line's crops are cut first and read together, so the encoder can batch them.
+    let mut crops = Vec::new();
+    let mut blocks = Vec::with_capacity(regions.len());
+    for r in regions {
+        let vertical = matches!(r.orientation, Orientation::Vertical);
+        // A detector that found no lines in a block reads the block as its one line.
+        let polygons = if r.line_polygons.is_empty() {
+            let [l, t, right, bottom] = r.bbox;
+            vec![[[l, t], [right, t], [right, bottom], [l, bottom]]]
+        } else {
+            r.line_polygons.clone()
         };
-        Ok(PageResult {
-            full_text: group.recognition.text.clone(),
-            groups: vec![group],
-        })
+        let polygons: Vec<_> = polygons
+            .into_iter()
+            .map(|polygon| {
+                let rect = [polygon[0][0], polygon[0][1], polygon[2][0], polygon[2][1]];
+                let first = crops.len();
+                crops.extend(lines::chunks(
+                    image,
+                    mask.as_ref(),
+                    rect,
+                    vertical,
+                    r.language,
+                    r.font_size,
+                ));
+                (polygon, first..crops.len())
+            })
+            .collect();
+        blocks.push((r, polygons));
+    }
+    let mut recognitions = reader.read_lines(&crops, options)?.into_iter();
+    let mut groups = Vec::with_capacity(blocks.len());
+    for (i, (r, polygons)) in blocks.into_iter().enumerate() {
+        let mut line_polygons = Vec::with_capacity(polygons.len());
+        let mut lines = Vec::with_capacity(polygons.len());
+        let mut parts = Vec::new();
+        for (polygon, chunks) in polygons {
+            let mut text = String::new();
+            for recognition in recognitions.by_ref().take(chunks.len()) {
+                text.push_str(&recognition.text);
+                parts.push(recognition);
+            }
+            if !text.is_empty() {
+                line_polygons.push(polygon);
+                lines.push(text);
+            }
+        }
+        if lines.is_empty() {
+            continue;
+        }
+        groups.push(PageGroup {
+            id: format!("block-{i}"),
+            bbox: r.bbox,
+            orientation: r.orientation,
+            line_polygons,
+            lines,
+            font_size: r.font_size,
+            detection_confidence: r.confidence,
+            recognition: joined(parts),
+        });
+    }
+    let full_text = groups
+        .iter()
+        .map(|g| g.recognition.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(PageResult { groups, full_text })
+}
+
+/// [`read_page`] for an image that may be a whole page or a snip of a few words.
+///
+/// The detector needs the context of a page around text to call it text, and a snip
+/// drawn tight around one line (a sound effect, a single caption) can give it none: it
+/// finds no block. Manga OCR itself was trained on exactly such crops, so when the
+/// detector comes back empty the whole image is read as one block, and kept only if
+/// the model is sure of it. Real text reads at a mean token log-probability near zero
+/// (-0.003 to -0.11 on the upstream corpus and snips of whole bubbles); a page, or
+/// artwork, read as one block is invented text below -0.7.
+pub fn read_region<R: LineReader + ?Sized, D: PageDetector + ?Sized>(
+    reader: &mut R,
+    image: &RgbImage,
+    detector: &mut D,
+    options: &OcrOptions,
+    detection: &DetectionOptions,
+) -> Result<PageResult> {
+    let page = read_page(reader, image, detector, options, detection)?;
+    if !page.groups.is_empty() {
+        return Ok(page);
+    }
+    let recognition = reader
+        .read_lines(std::slice::from_ref(image), options)?
+        .remove(0);
+    let sure = recognition
+        .mean_log_probability
+        .is_some_and(|p| p >= WHOLE_IMAGE_MIN_LOG_PROBABILITY);
+    if recognition.text.is_empty() || !sure || recognition.truncated {
+        return Ok(page);
+    }
+    let (width, height) = image.dimensions();
+    let group = PageGroup {
+        id: "block-0".into(),
+        bbox: [0, 0, width, height],
+        orientation: if height > width {
+            Orientation::Vertical
+        } else {
+            Orientation::Horizontal
+        },
+        line_polygons: Vec::new(),
+        lines: vec![recognition.text.clone()],
+        font_size: 0.,
+        // Not a detection: the detector found nothing here.
+        detection_confidence: 0.,
+        recognition,
+    };
+    Ok(PageResult {
+        full_text: group.recognition.text.clone(),
+        groups: vec![group],
+    })
+}
+
+/// A finished search as text: the vocabulary IDs without CLS and EOS, and its mean score.
+pub(crate) fn finish(h: generation::Hypothesis, vocab: &[String]) -> Recognition {
+    let mean_log_probability = Some(h.score / (h.ids.len() - 1) as f64);
+    let ids: Vec<_> = h.ids.into_iter().skip(1).filter(|&x| x != 3).collect();
+    Recognition {
+        text: post_process(&text::decode(&ids, vocab)),
+        token_ids: ids,
+        mean_log_probability,
+        truncated: !h.ended,
+    }
+}
+
+/// Reads line crops: what a page reading needs of a recognizer, whichever runtime it uses.
+pub trait LineReader {
+    /// One recognition per crop, in order; see [`MangaOcr::recognize_all`].
+    fn read_lines(&mut self, crops: &[RgbImage], options: &OcrOptions) -> Result<Vec<Recognition>>;
+}
+impl LineReader for MangaOcr {
+    fn read_lines(&mut self, crops: &[RgbImage], options: &OcrOptions) -> Result<Vec<Recognition>> {
+        self.recognize_all(crops, options)
     }
 }
 
