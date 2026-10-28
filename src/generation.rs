@@ -21,36 +21,40 @@ fn blocked(ids: &[u32], token: u32, n: usize) -> bool {
     ids.windows(n)
         .any(|w| &w[..n - 1] == prefix && w[n - 1] == token)
 }
-pub(crate) fn generate(
-    model: &Model,
-    encoded: &Tensor,
-    device: &Device,
-    options: &OcrOptions,
-) -> Result<Hypothesis> {
-    let b = options.beam_width;
-    let mut state = model.start(encoded)?;
-    let mut live = vec![
-        Hypothesis {
-            ids: vec![2],
-            score: f64::NEG_INFINITY,
-            ended: false
-        };
-        b
-    ];
-    live[0].score = 0.;
-    let mut finished = Vec::new();
-    for _ in 0..options.max_new_tokens {
-        let ids = Tensor::new(
-            live.iter()
-                .map(|h| *h.ids.last().unwrap())
-                .collect::<Vec<_>>(),
-            device,
-        )?
-        .unsqueeze(1)?;
-        let scores = model.step(&ids, &mut state)?.to_vec2::<f32>()?;
+/// One image's beam search, advanced a step at a time from the decoder's log-probabilities,
+/// so a decoder can step many images' beams in one batch.
+pub(crate) struct Beams {
+    live: Vec<Hypothesis>,
+    finished: Vec<Hypothesis>,
+}
+impl Beams {
+    pub fn new(width: usize) -> Self {
+        let mut live = vec![
+            Hypothesis {
+                ids: vec![2],
+                score: f64::NEG_INFINITY,
+                ended: false
+            };
+            width
+        ];
+        live[0].score = 0.;
+        Self {
+            live,
+            finished: Vec::new(),
+        }
+    }
+    /// The token each beam feeds the decoder next.
+    pub fn tokens(&self) -> Vec<u32> {
+        self.live.iter().map(|h| *h.ids.last().unwrap()).collect()
+    }
+    /// One step from `scores`, a row of vocabulary log-probabilities per beam. Answers the
+    /// beam each next beam continues (the decoder's cache order), or `None` once the search
+    /// is over.
+    pub fn advance(&mut self, scores: &[f32], options: &OcrOptions) -> Result<Option<Vec<u32>>> {
+        let b = options.beam_width;
         let mut candidates = Vec::with_capacity(b * 6144);
-        for (parent, row) in scores.iter().enumerate() {
-            if !live[parent].score.is_finite() {
+        for (parent, row) in scores.chunks_exact(6144).enumerate() {
+            if !self.live[parent].score.is_finite() {
                 continue;
             }
             for (token, &score) in row.iter().enumerate() {
@@ -58,13 +62,13 @@ pub(crate) fn generate(
                     return Err(Error::ModelContract("non-finite decoder logits".into()));
                 }
                 if blocked(
-                    &live[parent].ids,
+                    &self.live[parent].ids,
                     token as u32,
                     options.no_repeat_ngram_size,
                 ) {
                     continue;
                 }
-                let value = live[parent].score + f64::from(score);
+                let value = self.live[parent].score + f64::from(score);
                 if value.is_finite() {
                     candidates.push((value, parent, token as u32));
                 }
@@ -81,13 +85,13 @@ pub(crate) fn generate(
         let mut next = Vec::with_capacity(b);
         let mut parents = Vec::with_capacity(b);
         for (rank, (score, parent, token)) in candidates.into_iter().take(2 * b).enumerate() {
-            let mut h = live[parent].clone();
+            let mut h = self.live[parent].clone();
             h.ids.push(token);
             h.score = score;
             if token == 3 {
                 if rank < b {
                     h.ended = true;
-                    finished.push(h);
+                    self.finished.push(h);
                 }
             } else {
                 parents.push(parent as u32);
@@ -97,33 +101,57 @@ pub(crate) fn generate(
                 }
             }
         }
-        finished.sort_by(|a, b| {
+        self.finished.sort_by(|a, b| {
             b.rank(options.length_penalty)
                 .total_cmp(&a.rank(options.length_penalty))
         });
-        finished.truncate(b);
-        if finished.len() == b {
-            break;
+        self.finished.truncate(b);
+        if self.finished.len() == b {
+            return Ok(None);
         }
         if next.len() != b {
             return Err(Error::ModelContract(
                 "decoder produced too few finite candidates".into(),
             ));
         }
-        state.reorder(&Tensor::new(parents, device)?)?;
-        live = next;
+        self.live = next;
+        Ok(Some(parents))
     }
-    // Upstream early_stopping=true excludes live hypotheses once all beams finish.
-    if finished.len() < b {
-        finished.extend(live);
+    /// The best hypothesis once the search is over or the token budget is spent.
+    pub fn best(mut self, options: &OcrOptions) -> Result<Hypothesis> {
+        // Upstream early_stopping=true excludes live hypotheses once all beams finish.
+        if self.finished.len() < options.beam_width {
+            self.finished.extend(self.live);
+        }
+        self.finished
+            .into_iter()
+            .max_by(|a, b| {
+                a.rank(options.length_penalty)
+                    .total_cmp(&b.rank(options.length_penalty))
+            })
+            .ok_or_else(|| Error::ModelContract("empty generation".into()))
     }
-    finished
-        .into_iter()
-        .max_by(|a, b| {
-            a.rank(options.length_penalty)
-                .total_cmp(&b.rank(options.length_penalty))
-        })
-        .ok_or_else(|| Error::ModelContract("empty generation".into()))
+}
+pub(crate) fn generate(
+    model: &Model,
+    encoded: &Tensor,
+    device: &Device,
+    options: &OcrOptions,
+) -> Result<Hypothesis> {
+    let mut state = model.start(encoded)?;
+    let mut beams = Beams::new(options.beam_width);
+    for _ in 0..options.max_new_tokens {
+        let ids = Tensor::new(beams.tokens(), device)?.unsqueeze(1)?;
+        let scores = model
+            .step(&ids, &mut state)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        match beams.advance(&scores, options)? {
+            Some(parents) => state.reorder(&Tensor::new(parents, device)?)?,
+            None => break,
+        }
+    }
+    beams.best(options)
 }
 #[cfg(test)]
 mod tests {

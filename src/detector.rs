@@ -6,7 +6,9 @@ use candle_core::{Device, Tensor};
 use image::RgbImage;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-const SIZE: usize = 1024;
+pub(crate) const SIZE: usize = 1024;
+/// The YOLO head's rows: three anchors on its 128², 64² and 32² grids.
+const BLOCK_ROWS: usize = 3 * (128 * 128 + 64 * 64 + 32 * 32);
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Orientation {
@@ -82,6 +84,11 @@ fn iou(a: BoundingBox, b: BoundingBox) -> f64 {
 /// ("めぐみさ", "みさんに"). With `upscale` off an image smaller than the square keeps its
 /// own scale, so a snip looks like a corner of an ordinary page. Pages are unaffected.
 fn pixels(image: &RgbImage, device: &Device, upscale: bool) -> Result<(Tensor, u32, u32)> {
+    let (data, w, h) = pixel_data(image, upscale)?;
+    Ok((Tensor::from_vec(data, (1, 3, SIZE, SIZE), device)?, w, h))
+}
+/// `pixels` as plain NCHW data, for a runtime other than Candle.
+pub(crate) fn pixel_data(image: &RgbImage, upscale: bool) -> Result<(Vec<f32>, u32, u32)> {
     crate::preprocess::validate(image)?;
     let fit = SIZE as f64 / f64::from(image.width().max(image.height()));
     let ratio = if upscale { fit } else { fit.min(1.) };
@@ -109,7 +116,7 @@ fn pixels(image: &RgbImage, device: &Device, upscale: bool) -> Result<(Tensor, u
             }
         }
     }
-    Ok((Tensor::from_vec(data, (1, 3, SIZE, SIZE), device)?, w, h))
+    Ok((data, w, h))
 }
 fn mapped(b: [f32; 4], image: &RgbImage, w: u32, h: u32) -> Option<BoundingBox> {
     if b.iter().any(|v| !v.is_finite()) {
@@ -235,15 +242,43 @@ impl ComicTextDetector {
         let output = self.graph.forward(input)?;
         if output["blk"].dims() != [1, 64512, 7]
             || output["det"].dims() != [1, 2, SIZE, SIZE]
+            || output["blk"].dims() != [1, BLOCK_ROWS, 7]
             || output["seg"].dims() != [1, 1, SIZE, SIZE]
         {
             return Err(Error::ModelContract(
                 "unexpected detector output shapes".into(),
             ));
         }
-        let predictions = output["blk"].squeeze(0)?.to_vec2::<f32>()?;
-        let mut boxes: Vec<_> = predictions
-            .iter()
+        let blk = output["blk"].flatten_all()?.to_vec1::<f32>()?;
+        let det = output["det"]
+            .narrow(1, 0, 1)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let seg = output["seg"].flatten_all()?.to_vec1::<f32>()?;
+        page(image, w, h, &blk, &det, seg, options)
+    }
+}
+
+/// Blocks and lines from the detector's three outputs, however they were computed: `blk`,
+/// `[64512, 7]` YOLO rows; `det`, DBNet's shrink map; `seg`, the text mask (both 1024 squares).
+/// `w`×`h` is the image's extent on the square.
+pub(crate) fn page(
+    image: &RgbImage,
+    w: u32,
+    h: u32,
+    blk: &[f32],
+    det: &[f32],
+    seg: Vec<f32>,
+    options: &DetectionOptions,
+) -> Result<(Vec<DetectedGroup>, TextMask)> {
+    {
+        if blk.len() != BLOCK_ROWS * 7 || det.len() != SIZE * SIZE || seg.len() != SIZE * SIZE {
+            return Err(Error::ModelContract(
+                "unexpected detector output shapes".into(),
+            ));
+        }
+        let mut boxes: Vec<_> = blk
+            .chunks_exact(7)
             .filter_map(|p| {
                 let score = p[4] * p[5].max(p[6]);
                 if !score.is_finite() || score < options.confidence_threshold {
@@ -307,11 +342,7 @@ impl ComicTextDetector {
                 language,
             })
             .collect();
-        let map = output["det"]
-            .narrow(1, 0, 1)?
-            .flatten_all()?
-            .to_vec1::<f32>()?;
-        let lines: Vec<_> = lines(&map, options.line_threshold, w, h)
+        let lines: Vec<_> = lines(det, options.line_threshold, w, h)
             .into_iter()
             .filter_map(|line| {
                 // Scaled to the page and truncated, as the reference casts them.
@@ -329,7 +360,7 @@ impl ComicTextDetector {
             })
             .collect();
         let mask = TextMask {
-            values: output["seg"].flatten_all()?.to_vec1::<f32>()?,
+            values: seg,
             scale_x: f64::from(w) / f64::from(image.width()),
             scale_y: f64::from(h) / f64::from(image.height()),
         };
