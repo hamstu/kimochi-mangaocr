@@ -6,7 +6,9 @@ use candle_core::{Device, Tensor};
 use image::RgbImage;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-const SIZE: usize = 1024;
+pub(crate) const SIZE: usize = 1024;
+/// The YOLO head's rows: three anchors on its 128², 64² and 32² grids.
+const BLOCK_ROWS: usize = 3 * (128 * 128 + 64 * 64 + 32 * 32);
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Orientation {
@@ -82,6 +84,11 @@ fn iou(a: BoundingBox, b: BoundingBox) -> f64 {
 /// ("めぐみさ", "みさんに"). With `upscale` off an image smaller than the square keeps its
 /// own scale, so a snip looks like a corner of an ordinary page. Pages are unaffected.
 fn pixels(image: &RgbImage, device: &Device, upscale: bool) -> Result<(Tensor, u32, u32)> {
+    let (data, w, h) = pixel_data(image, upscale)?;
+    Ok((Tensor::from_vec(data, (1, 3, SIZE, SIZE), device)?, w, h))
+}
+/// `pixels` as plain NCHW data, for a runtime other than Candle.
+pub(crate) fn pixel_data(image: &RgbImage, upscale: bool) -> Result<(Vec<f32>, u32, u32)> {
     crate::preprocess::validate(image)?;
     let fit = SIZE as f64 / f64::from(image.width().max(image.height()));
     let ratio = if upscale { fit } else { fit.min(1.) };
@@ -109,7 +116,7 @@ fn pixels(image: &RgbImage, device: &Device, upscale: bool) -> Result<(Tensor, u
             }
         }
     }
-    Ok((Tensor::from_vec(data, (1, 3, SIZE, SIZE), device)?, w, h))
+    Ok((data, w, h))
 }
 fn mapped(b: [f32; 4], image: &RgbImage, w: u32, h: u32) -> Option<BoundingBox> {
     if b.iter().any(|v| !v.is_finite()) {
@@ -235,141 +242,163 @@ impl ComicTextDetector {
         let output = self.graph.forward(input)?;
         if output["blk"].dims() != [1, 64512, 7]
             || output["det"].dims() != [1, 2, SIZE, SIZE]
+            || output["blk"].dims() != [1, BLOCK_ROWS, 7]
             || output["seg"].dims() != [1, 1, SIZE, SIZE]
         {
             return Err(Error::ModelContract(
                 "unexpected detector output shapes".into(),
             ));
         }
-        let predictions = output["blk"].squeeze(0)?.to_vec2::<f32>()?;
-        let mut boxes: Vec<_> = predictions
-            .iter()
-            .filter_map(|p| {
-                let score = p[4] * p[5].max(p[6]);
-                if !score.is_finite() || score < options.confidence_threshold {
-                    return None;
-                }
-                // The head's classes are the reference's LANG_LIST: English, then Japanese.
-                let language = if p[6] > p[5] {
-                    Language::Ja
-                } else {
-                    Language::Eng
-                };
-                mapped(
-                    [
-                        p[0] - p[2] / 2.,
-                        p[1] - p[3] / 2.,
-                        p[0] + p[2] / 2.,
-                        p[1] + p[3] / 2.,
-                    ],
-                    image,
-                    w,
-                    h,
-                )
-                .map(|b| (b, score, language))
-            })
-            .collect();
-        boxes.sort_by(|a, b| b.1.total_cmp(&a.1));
-        let mut accepted: Vec<(BoundingBox, f32, Language)> = Vec::new();
-        for candidate in boxes {
-            if accepted
-                .iter()
-                .any(|g| iou(g.0, candidate.0) > f64::from(options.nms_threshold))
-            {
-                continue;
-            }
-            accepted.push(candidate);
-            if accepted.len() == options.max_regions {
-                break;
-            }
-        }
-        // A block lying almost wholly inside a larger one is the same text found twice
-        // (non-maximum suppression compares overlap with the union, so it keeps a small
-        // box inside a big one). The reference keeps it, and with no line of its own it is
-        // read again from its box, repeating the line; it is dropped here.
-        let contained: Vec<bool> = (0..accepted.len())
-            .map(|i| {
-                let a = accepted[i].0;
-                accepted.iter().enumerate().any(|(j, other)| {
-                    let b = other.0;
-                    let larger = area(b) > area(a) || (area(b) == area(a) && j < i);
-                    j != i && larger && intersection_fraction(a, b) >= CONTAINED
-                })
-            })
-            .collect();
-        let mut keep = contained.iter().map(|c| !c);
-        accepted.retain(|_| keep.next().unwrap_or(true));
-        let candidates: Vec<_> = accepted
-            .iter()
-            .map(|&(bbox, confidence, language)| Candidate {
-                bbox: bbox.map(f64::from),
-                confidence,
-                language,
-            })
-            .collect();
-        let map = output["det"]
+        let blk = output["blk"].flatten_all()?.to_vec1::<f32>()?;
+        let det = output["det"]
             .narrow(1, 0, 1)?
             .flatten_all()?
             .to_vec1::<f32>()?;
-        let lines: Vec<_> = lines(&map, options.line_threshold, w, h)
-            .into_iter()
-            .filter_map(|line| {
-                // Scaled to the page and truncated, as the reference casts them.
-                let (sx, sy) = (
-                    f64::from(image.width()) / f64::from(w),
-                    f64::from(image.height()) / f64::from(h),
-                );
+        let seg = output["seg"].flatten_all()?.to_vec1::<f32>()?;
+        page(image, w, h, &blk, &det, seg, options)
+    }
+}
+
+/// Blocks and lines from the detector's three outputs, however they were computed: `blk`,
+/// `[64512, 7]` YOLO rows; `det`, DBNet's shrink map; `seg`, the text mask (both 1024 squares).
+/// `w`×`h` is the image's extent on the square.
+pub(crate) fn page(
+    image: &RgbImage,
+    w: u32,
+    h: u32,
+    blk: &[f32],
+    det: &[f32],
+    seg: Vec<f32>,
+    options: &DetectionOptions,
+) -> Result<(Vec<DetectedGroup>, TextMask)> {
+    if blk.len() != BLOCK_ROWS * 7 || det.len() != SIZE * SIZE || seg.len() != SIZE * SIZE {
+        return Err(Error::ModelContract(
+            "unexpected detector output shapes".into(),
+        ));
+    }
+    let mut boxes: Vec<_> = blk
+        .chunks_exact(7)
+        .filter_map(|p| {
+            let score = p[4] * p[5].max(p[6]);
+            if !score.is_finite() || score < options.confidence_threshold {
+                return None;
+            }
+            // The head's classes are the reference's LANG_LIST: English, then Japanese.
+            let language = if p[6] > p[5] {
+                Language::Ja
+            } else {
+                Language::Eng
+            };
+            mapped(
+                [
+                    p[0] - p[2] / 2.,
+                    p[1] - p[3] / 2.,
+                    p[0] + p[2] / 2.,
+                    p[1] + p[3] / 2.,
+                ],
+                image,
+                w,
+                h,
+            )
+            .map(|b| (b, score, language))
+        })
+        .collect();
+    boxes.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let mut accepted: Vec<(BoundingBox, f32, Language)> = Vec::new();
+    for candidate in boxes {
+        if accepted
+            .iter()
+            .any(|g| iou(g.0, candidate.0) > f64::from(options.nms_threshold))
+        {
+            continue;
+        }
+        accepted.push(candidate);
+        if accepted.len() == options.max_regions {
+            break;
+        }
+    }
+    // A block lying almost wholly inside a larger one is the same text found twice
+    // (non-maximum suppression compares overlap with the union, so it keeps a small
+    // box inside a big one). The reference keeps it, and with no line of its own it is
+    // read again from its box, repeating the line; it is dropped here.
+    let contained: Vec<bool> = (0..accepted.len())
+        .map(|i| {
+            let a = accepted[i].0;
+            accepted.iter().enumerate().any(|(j, other)| {
+                let b = other.0;
+                let larger = area(b) > area(a) || (area(b) == area(a) && j < i);
+                j != i && larger && intersection_fraction(a, b) >= CONTAINED
+            })
+        })
+        .collect();
+    let mut keep = contained.iter().map(|c| !c);
+    accepted.retain(|_| keep.next().unwrap_or(true));
+    let candidates: Vec<_> = accepted
+        .iter()
+        .map(|&(bbox, confidence, language)| Candidate {
+            bbox: bbox.map(f64::from),
+            confidence,
+            language,
+        })
+        .collect();
+    let lines: Vec<_> = lines(det, options.line_threshold, w, h)
+        .into_iter()
+        .filter_map(|line| {
+            // Scaled to the page and truncated, as the reference casts them.
+            let (sx, sy) = (
+                f64::from(image.width()) / f64::from(w),
+                f64::from(image.height()) / f64::from(h),
+            );
+            let r = [
+                (f64::from(line[0]) * sx).trunc(),
+                (f64::from(line[1]) * sy).trunc(),
+                (f64::from(line[2]) * sx).trunc(),
+                (f64::from(line[3]) * sy).trunc(),
+            ];
+            (r[0] < r[2] && r[1] < r[3]).then_some(r)
+        })
+        .collect();
+    let mask = TextMask {
+        values: seg,
+        scale_x: f64::from(w) / f64::from(image.width()),
+        scale_y: f64::from(h) / f64::from(image.height()),
+    };
+    let (im_w, im_h) = (f64::from(image.width()), f64::from(image.height()));
+    let groups = blocks::group(&candidates, &lines, im_w, im_h, |r| mask.mean(r))
+        .into_iter()
+        .take(options.max_regions)
+        .filter_map(|b| {
+            let clamp = |r: blocks::Rect| -> Option<BoundingBox> {
                 let r = [
-                    (f64::from(line[0]) * sx).trunc(),
-                    (f64::from(line[1]) * sy).trunc(),
-                    (f64::from(line[2]) * sx).trunc(),
-                    (f64::from(line[3]) * sy).trunc(),
+                    r[0].clamp(0., im_w) as u32,
+                    r[1].clamp(0., im_h) as u32,
+                    r[2].clamp(0., im_w) as u32,
+                    r[3].clamp(0., im_h) as u32,
                 ];
                 (r[0] < r[2] && r[1] < r[3]).then_some(r)
+            };
+            let line_polygons: Vec<_> = b
+                .lines
+                .iter()
+                .filter_map(|&l| clamp(l))
+                .map(polygon)
+                .collect();
+            Some(DetectedGroup {
+                bbox: clamp(b.bbox)?,
+                confidence: b.confidence,
+                orientation: if b.vertical {
+                    Orientation::Vertical
+                } else {
+                    Orientation::Horizontal
+                },
+                line_polygons,
+                font_size: b.font_size as f32,
+                language: b.language,
             })
-            .collect();
-        let mask = TextMask {
-            values: output["seg"].flatten_all()?.to_vec1::<f32>()?,
-            scale_x: f64::from(w) / f64::from(image.width()),
-            scale_y: f64::from(h) / f64::from(image.height()),
-        };
-        let (im_w, im_h) = (f64::from(image.width()), f64::from(image.height()));
-        let groups = blocks::group(&candidates, &lines, im_w, im_h, |r| mask.mean(r))
-            .into_iter()
-            .take(options.max_regions)
-            .filter_map(|b| {
-                let clamp = |r: blocks::Rect| -> Option<BoundingBox> {
-                    let r = [
-                        r[0].clamp(0., im_w) as u32,
-                        r[1].clamp(0., im_h) as u32,
-                        r[2].clamp(0., im_w) as u32,
-                        r[3].clamp(0., im_h) as u32,
-                    ];
-                    (r[0] < r[2] && r[1] < r[3]).then_some(r)
-                };
-                let line_polygons: Vec<_> = b
-                    .lines
-                    .iter()
-                    .filter_map(|&l| clamp(l))
-                    .map(polygon)
-                    .collect();
-                Some(DetectedGroup {
-                    bbox: clamp(b.bbox)?,
-                    confidence: b.confidence,
-                    orientation: if b.vertical {
-                        Orientation::Vertical
-                    } else {
-                        Orientation::Horizontal
-                    },
-                    line_polygons,
-                    font_size: b.font_size as f32,
-                    language: b.language,
-                })
-            })
-            .filter(|g| !g.line_polygons.is_empty())
-            .collect();
-        Ok((groups, mask))
-    }
+        })
+        .filter(|g| !g.line_polygons.is_empty())
+        .collect();
+    Ok((groups, mask))
 }
 
 /// The detector's text mask (0 to 1), read in page pixels.

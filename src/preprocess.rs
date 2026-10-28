@@ -30,6 +30,14 @@ fn weights(from: usize) -> Vec<Vec<(usize, i64)>> {
 }
 /// Pillow-compatible grayscale followed by antialiased bilinear square resize.
 pub(crate) fn pixels(image: &RgbImage, device: &Device) -> Result<Tensor> {
+    Ok(Tensor::from_vec(
+        pixel_data(image)?,
+        (1, 3, SIZE, SIZE),
+        device,
+    )?)
+}
+/// `pixels` as plain NCHW data, for a runtime other than Candle.
+pub(crate) fn pixel_data(image: &RgbImage) -> Result<Vec<f32>> {
     validate(image)?;
     let (w, h) = (image.width() as usize, image.height() as usize);
     let gray: Vec<u8> = image
@@ -64,7 +72,7 @@ pub(crate) fn pixels(image: &RgbImage, device: &Device) -> Result<Tensor> {
             }
         }
     }
-    Ok(Tensor::from_vec(out, (1, 3, SIZE, SIZE), device)?)
+    Ok(out)
 }
 pub(crate) fn validate(image: &RgbImage) -> Result<()> {
     if image.width() == 0 || image.height() == 0 {

@@ -2,8 +2,9 @@
 //! format here, not an inference runtime. Weights are uploaded once; dead tensors
 //! are released after their last consumer to bound page-inference memory.
 use crate::{Error, Result};
-use candle_core::{Device, Tensor};
+use candle_core::{Device, Storage, Tensor};
 use prost::Message;
+use rayon::prelude::*;
 use std::collections::HashMap;
 #[derive(Clone, PartialEq, Message)]
 struct Model {
@@ -197,6 +198,7 @@ impl DetectorGraph {
         })
     }
     pub fn forward(&self, input: Tensor) -> Result<HashMap<String, Tensor>> {
+        let _flush = matches!(input.device(), Device::Cpu).then(FlushDenormals::new);
         let mut values = self.weights.clone();
         values.insert("images".into(), input);
         let mut uses = self.uses.clone();
@@ -214,7 +216,12 @@ impl DetectorGraph {
                     let p = n.padding()?;
                     let s = n.pair("strides", 1)?;
                     let d = n.pair("dilations", 1)?;
-                    let y = if n.op == "Conv" {
+                    let y = if n.op == "Conv"
+                        && matches!(x.device(), Device::Cpu)
+                        && n.int("group", 1) == 1
+                    {
+                        conv_cpu(x, get(1)?, p, s, d)?
+                    } else if n.op == "Conv" {
                         let (_, c, h, w) = x.dims4()?;
                         // Candle 0.9.2's CPU tiled convolution mistakes contiguous
                         // NCHW for NHWC when C == H == W. Force distinct spatial
@@ -231,7 +238,11 @@ impl DetectorGraph {
                                 "grouped transpose convolution".into(),
                             ));
                         }
-                        x.contiguous()?.conv_transpose2d(get(1)?, p, 0, s, d)?
+                        if matches!(x.device(), Device::Cpu) {
+                            conv_transpose_cpu(x, get(1)?, p, s, d)?
+                        } else {
+                            x.contiguous()?.conv_transpose2d(get(1)?, p, 0, s, d)?
+                        }
                     };
                     if n.input.len() > 2 {
                         y.broadcast_add(&get(2)?.reshape((1, (), 1, 1))?)?
@@ -381,5 +392,242 @@ impl DetectorGraph {
                     .ok_or_else(|| Error::ModelContract(format!("missing detector output {s}")))
             })
             .collect()
+    }
+}
+
+/// The most floats one band of a CPU convolution's column matrix holds (64 MB).
+const BAND_FLOATS: usize = 16 << 20;
+
+/// `ConvTranspose` on the CPU as matrix products and a scatter of their columns (col2im).
+///
+/// Candle 0.9.2's CPU transposed convolution takes one dot product per output pixel through
+/// its own `vec_dot`, which is vectorized only when the whole binary is compiled with AVX2 (or
+/// NEON): on a stock x86-64 build it is a scalar loop, and the detector's upsampling layers,
+/// half its work even with NEON, dominated a Windows scan that took over a minute. Here the arithmetic is one product of the
+/// weights, `[c_out·k·k, c_in]`, with a band of input rows, `[c_in, rows·w]`, through gemm,
+/// which picks AVX2/FMA or NEON at run time; each column then adds into the k×k output pixels
+/// it belongs to. Bands keep that column matrix bounded on the 1024-square canvas.
+fn conv_transpose_cpu(
+    x: &Tensor,
+    kernel: &Tensor,
+    padding: usize,
+    stride: usize,
+    dilation: usize,
+) -> Result<Tensor> {
+    let (batch, c_in, in_h, in_w) = x.dims4()?;
+    let (k_in, c_out, k_h, k_w) = kernel.dims4()?;
+    if k_in != c_in {
+        return Err(Error::ModelContract(
+            "transpose convolution channel mismatch".into(),
+        ));
+    }
+    let span = |input: usize, k: usize| {
+        ((input - 1) * stride + dilation * (k - 1) + 1)
+            .checked_sub(2 * padding)
+            .ok_or_else(|| Error::ModelContract("transpose convolution padding".into()))
+    };
+    let (out_h, out_w) = (span(in_h, k_h)?, span(in_w, k_w)?);
+    let taps = k_h * k_w;
+    let weights = kernel.reshape((c_in, c_out * taps))?.t()?.contiguous()?;
+    let rows = (BAND_FLOATS / (c_out * taps * in_w)).clamp(1, in_h);
+    let plane = out_h * out_w;
+    let mut out = vec![0f32; batch * c_out * plane];
+    for b in 0..batch {
+        let image = x.get(b)?;
+        let out = &mut out[b * c_out * plane..(b + 1) * c_out * plane];
+        for y0 in (0..in_h).step_by(rows) {
+            let n = rows.min(in_h - y0);
+            let band = image
+                .narrow(1, y0, n)?
+                .contiguous()?
+                .reshape((c_in, n * in_w))?;
+            let cols = weights.matmul(&band)?;
+            let (storage, layout) = cols.storage_and_layout();
+            let Storage::Cpu(storage) = &*storage else {
+                unreachable!("CPU tensors")
+            };
+            let cols = &storage.as_slice::<f32>()?[layout.start_offset()..];
+            let width = n * in_w;
+            out.par_chunks_mut(plane)
+                .enumerate()
+                .for_each(|(channel, plane)| {
+                    for ky in 0..k_h {
+                        for kx in 0..k_w {
+                            let tap = (channel * taps + ky * k_w + kx) * width;
+                            for iy in 0..n {
+                                let Some(oy) = ((y0 + iy) * stride + ky * dilation)
+                                    .checked_sub(padding)
+                                    .filter(|&oy| oy < out_h)
+                                else {
+                                    continue;
+                                };
+                                let row = &cols[tap + iy * in_w..tap + (iy + 1) * in_w];
+                                let dst = &mut plane[oy * out_w..(oy + 1) * out_w];
+                                for (ix, v) in row.iter().enumerate() {
+                                    if let Some(ox) = (ix * stride + kx * dilation)
+                                        .checked_sub(padding)
+                                        .filter(|&ox| ox < out_w)
+                                    {
+                                        dst[ox] += v;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+        }
+    }
+    Ok(Tensor::from_vec(
+        out,
+        (batch, c_out, out_h, out_w),
+        x.device(),
+    )?)
+}
+
+/// `Conv` on the CPU as one matrix product per band of output rows (im2col).
+///
+/// Candle 0.9.2's CPU convolution gathers its column matrix one element at a time in tiles of
+/// 512 pixels, at a fraction of gemm's speed. Here each column-matrix row, one input channel
+/// at one kernel tap, is filled a whole output row at a time from one input row, and the
+/// product of the weights, `[c_out, c_in·k·k]`, with a band of it, `[c_in·k·k, rows·w]`, lands
+/// directly in those rows of every output channel.
+fn conv_cpu(
+    x: &Tensor,
+    kernel: &Tensor,
+    padding: usize,
+    stride: usize,
+    dilation: usize,
+) -> Result<Tensor> {
+    let (batch, c_in, in_h, in_w) = x.dims4()?;
+    let (c_out, k_in, k_h, k_w) = kernel.dims4()?;
+    if k_in != c_in {
+        return Err(Error::ModelContract("convolution channel mismatch".into()));
+    }
+    let span = |input: usize, k: usize| {
+        (input + 2 * padding)
+            .checked_sub(dilation * (k - 1) + 1)
+            .map(|v| v / stride + 1)
+            .ok_or_else(|| Error::ModelContract("convolution kernel exceeds input".into()))
+    };
+    let (out_h, out_w) = (span(in_h, k_h)?, span(in_w, k_w)?);
+    let depth = c_in * k_h * k_w;
+    let weights = kernel.reshape((c_out, depth))?.contiguous()?;
+    let x = x.contiguous()?;
+    let (storage, layout) = x.storage_and_layout();
+    let Storage::Cpu(storage) = &*storage else {
+        unreachable!("CPU tensors")
+    };
+    let input = &storage.as_slice::<f32>()?[layout.start_offset()..];
+    let rows = (BAND_FLOATS / (depth * out_w)).clamp(1, out_h);
+    let plane = out_h * out_w;
+    let mut out = vec![0f32; batch * c_out * plane];
+    for b in 0..batch {
+        let input = &input[b * c_in * in_h * in_w..(b + 1) * c_in * in_h * in_w];
+        let out = &mut out[b * c_out * plane..(b + 1) * c_out * plane];
+        for y0 in (0..out_h).step_by(rows) {
+            let n = rows.min(out_h - y0);
+            let width = n * out_w;
+            let mut cols = vec![0f32; depth * width];
+            cols.par_chunks_mut(width).enumerate().for_each(|(r, dst)| {
+                let (c, ky, kx) = (r / (k_h * k_w), r / k_w % k_h, r % k_w);
+                let src = &input[c * in_h * in_w..(c + 1) * in_h * in_w];
+                for oy in 0..n {
+                    let Some(iy) = ((y0 + oy) * stride + ky * dilation)
+                        .checked_sub(padding)
+                        .filter(|&iy| iy < in_h)
+                    else {
+                        continue;
+                    };
+                    let src = &src[iy * in_w..(iy + 1) * in_w];
+                    let dst = &mut dst[oy * out_w..(oy + 1) * out_w];
+                    for (ox, v) in dst.iter_mut().enumerate() {
+                        if let Some(ix) = (ox * stride + kx * dilation)
+                            .checked_sub(padding)
+                            .filter(|&ix| ix < in_w)
+                        {
+                            *v = src[ix];
+                        }
+                    }
+                }
+            });
+            let product = weights.matmul(&Tensor::from_vec(cols, (depth, width), x.device())?)?;
+            let (storage, layout) = product.storage_and_layout();
+            let Storage::Cpu(storage) = &*storage else {
+                unreachable!("CPU tensors")
+            };
+            let product = &storage.as_slice::<f32>()?[layout.start_offset()..];
+            out.par_chunks_mut(plane)
+                .zip(product.par_chunks(width))
+                .for_each(|(plane, row)| {
+                    plane[y0 * out_w..y0 * out_w + width].copy_from_slice(row);
+                });
+        }
+    }
+    Ok(Tensor::from_vec(
+        out,
+        (batch, c_out, out_h, out_w),
+        x.device(),
+    )?)
+}
+
+/// Subnormal floats flushed to zero (x86's FTZ and DAZ) on this thread and every thread of
+/// rayon's global pool, Candle's and gemm's workers, for the guard's lifetime; each thread's
+/// own setting comes back on drop.
+///
+/// The detector reads a snip on a 1024 square that is mostly black padding, and its
+/// activations there decay through LeakyReLU, SiLU and sigmoid tails into subnormals. x86
+/// cores take a microcode assist on every subnormal operand, around a hundred times the
+/// cost of a normal one: on an i7-7700K a 690×240 snip's detection took 27.6 s, and 2.9 s
+/// flushed. Apple's cores handle subnormals at full speed, which is why no Mac showed it.
+/// Values below 1.2e-38 cannot move a detection.
+struct FlushDenormals {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    saved: (u32, Vec<u32>),
+}
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+mod mxcsr {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86 as arch;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64 as arch;
+    /// Flush-to-zero (bit 15) and denormals-are-zero (bit 6).
+    const FLUSH: u32 = 0x8040;
+    /// Sets FTZ and DAZ on the calling thread, answering its previous MXCSR.
+    pub fn flush() -> u32 {
+        // SSE is in the baseline of every x86-64 target. `_mm_setcsr` is deprecated only in
+        // favour of inline assembly, for code that relies on the compiler's ordering of
+        // floating-point operations around it; nothing here does.
+        #[allow(deprecated)]
+        unsafe {
+            let previous = arch::_mm_getcsr();
+            arch::_mm_setcsr(previous | FLUSH);
+            previous
+        }
+    }
+    pub fn restore(previous: u32) {
+        #[allow(deprecated)]
+        unsafe {
+            arch::_mm_setcsr(previous)
+        }
+    }
+}
+impl FlushDenormals {
+    fn new() -> Self {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        return Self {
+            saved: (mxcsr::flush(), rayon::broadcast(|_| mxcsr::flush())),
+        };
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        Self {}
+    }
+}
+impl Drop for FlushDenormals {
+    fn drop(&mut self) {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            let (own, pool) = &self.saved;
+            rayon::broadcast(|context| mxcsr::restore(pool[context.index()]));
+            mxcsr::restore(*own);
+        }
     }
 }
