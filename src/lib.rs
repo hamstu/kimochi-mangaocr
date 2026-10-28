@@ -8,6 +8,8 @@ mod lines;
 pub use blocks::Language;
 pub use detector::{ComicTextDetector, DetectedGroup, DetectionOptions, Orientation, TextMask};
 mod model;
+#[cfg(feature = "onnx")]
+pub mod onnx;
 mod preprocess;
 mod text;
 use candle_core::{DType, Device, Tensor};
@@ -31,6 +33,9 @@ pub enum Error {
     Image(#[from] image::ImageError),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    #[cfg(feature = "onnx")]
+    #[error(transparent)]
+    Onnx(#[from] ort::Error),
 }
 pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug, Clone)]
@@ -184,7 +189,7 @@ fn select_backend(requested: Backend) -> Result<(Device, BackendInfo)> {
     }
     unreachable!("CPU always available")
 }
-fn validate_model(path: &Path) -> Result<()> {
+pub(crate) fn validate_model(path: &Path) -> Result<()> {
     let c: serde_json::Value = serde_json::from_reader(std::fs::File::open(path)?)?;
     for (pointer, expected) in [
         ("/encoder/hidden_size", 768),
@@ -238,6 +243,18 @@ fn validate_model(path: &Path) -> Result<()> {
     }
     Ok(())
 }
+pub(crate) fn load_vocab(path: &Path) -> Result<Vec<String>> {
+    let vocab: Vec<String> = std::fs::read_to_string(path)?
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    if vocab.len() != 6144 || vocab[..5] != ["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]"] {
+        return Err(Error::ModelContract(
+            "expected upstream 6144-token Japanese character vocabulary".into(),
+        ));
+    }
+    Ok(vocab)
+}
 /// Decode PNG/JPEG/WebP in Rust. JPEG uses an accurate integer decoder to
 /// minimize differences from upstream Pillow/libjpeg on sensitive crops.
 pub fn decode_image(bytes: &[u8]) -> Result<RgbImage> {
@@ -266,15 +283,7 @@ impl MangaOcr {
     }
     pub fn with_config(paths: ModelPaths, config: Config) -> Result<Self> {
         validate_model(&paths.config)?;
-        let vocab: Vec<String> = std::fs::read_to_string(&paths.vocab)?
-            .lines()
-            .map(str::to_owned)
-            .collect();
-        if vocab.len() != 6144 || vocab[..5] != ["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]"] {
-            return Err(Error::ModelContract(
-                "expected upstream 6144-token Japanese character vocabulary".into(),
-            ));
-        }
+        let vocab = load_vocab(&paths.vocab)?;
         let (device, backend) = select_backend(config.backend)?;
         let vb = if paths
             .weights
