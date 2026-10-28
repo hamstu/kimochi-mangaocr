@@ -10,7 +10,7 @@ pub use detector::{ComicTextDetector, DetectedGroup, DetectionOptions, Orientati
 mod model;
 mod preprocess;
 mod text;
-use candle_core::{DType, Device};
+use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use image::RgbImage;
 use serde::{Deserialize, Serialize};
@@ -309,26 +309,59 @@ impl MangaOcr {
         self.recognize(&decode_image(&std::fs::read(path)?)?, options)
     }
     pub fn recognize(&mut self, image: &RgbImage, options: &OcrOptions) -> Result<Recognition> {
+        let mut all = self.recognize_all(std::slice::from_ref(image), options)?;
+        Ok(all.remove(0))
+    }
+    /// `recognize` for each image, in order. The encoder takes up to [`ENCODE_BATCH`] of them in
+    /// one pass: one image's 197 tokens make matrix products too small to spread over a CPU's
+    /// cores, and a page reads dozens of line crops.
+    pub fn recognize_all(
+        &mut self,
+        images: &[RgbImage],
+        options: &OcrOptions,
+    ) -> Result<Vec<Recognition>> {
         options.validate()?;
-        preprocess::validate(image)?;
-        if options.skip_uniform_images && image.pixels().all(|p| p == image.get_pixel(0, 0)) {
-            return Ok(Recognition {
-                text: String::new(),
-                token_ids: Vec::new(),
-                mean_log_probability: None,
-                truncated: false,
-            });
+        for image in images {
+            preprocess::validate(image)?;
         }
-        let pixels = preprocess::pixels(image, &self.device)?;
-        let h = generation::generate(&self.model, &pixels, &self.device, options)?;
-        let mean_log_probability = Some(h.score / (h.ids.len() - 1) as f64);
-        let ids: Vec<_> = h.ids.into_iter().skip(1).filter(|&x| x != 3).collect();
-        Ok(Recognition {
-            text: post_process(&text::decode(&ids, &self.vocab)),
-            token_ids: ids,
-            mean_log_probability,
-            truncated: !h.ended,
-        })
+        let mut out = vec![None; images.len()];
+        let mut pending = Vec::with_capacity(images.len());
+        for (i, image) in images.iter().enumerate() {
+            if options.skip_uniform_images && image.pixels().all(|p| p == image.get_pixel(0, 0)) {
+                out[i] = Some(Recognition {
+                    text: String::new(),
+                    token_ids: Vec::new(),
+                    mean_log_probability: None,
+                    truncated: false,
+                });
+            } else {
+                pending.push(i);
+            }
+        }
+        for batch in pending.chunks(ENCODE_BATCH) {
+            let pixels = batch
+                .iter()
+                .map(|&i| preprocess::pixels(&images[i], &self.device))
+                .collect::<Result<Vec<_>>>()?;
+            let encoded = self.model.encode(&Tensor::cat(&pixels, 0)?)?;
+            for (j, &i) in batch.iter().enumerate() {
+                let h = generation::generate(
+                    &self.model,
+                    &encoded.narrow(0, j, 1)?,
+                    &self.device,
+                    options,
+                )?;
+                let mean_log_probability = Some(h.score / (h.ids.len() - 1) as f64);
+                let ids: Vec<_> = h.ids.into_iter().skip(1).filter(|&x| x != 3).collect();
+                out[i] = Some(Recognition {
+                    text: post_process(&text::decode(&ids, &self.vocab)),
+                    token_ids: ids,
+                    mean_log_probability,
+                    truncated: !h.ended,
+                });
+            }
+        }
+        Ok(out.into_iter().flatten().collect())
     }
     /// Validate every box before inference. Regions retain the caller's reading order.
     pub fn recognize_regions(
@@ -351,18 +384,22 @@ impl MangaOcr {
                 return Err(Error::InvalidInput(format!("invalid region: {:?}", r.bbox)));
             }
         }
-        regions
+        let crops: Vec<_> = regions
             .iter()
             .map(|r| {
                 let [l, t, right, bottom] = r.bbox;
-                let crop = image::imageops::crop_imm(image, l, t, right - l, bottom - t).to_image();
-                Ok(TextRegion {
-                    bbox: r.bbox,
-                    detection_confidence: r.confidence,
-                    recognition: self.recognize(&crop, options)?,
-                })
+                image::imageops::crop_imm(image, l, t, right - l, bottom - t).to_image()
             })
-            .collect()
+            .collect();
+        Ok(regions
+            .iter()
+            .zip(self.recognize_all(&crops, options)?)
+            .map(|(r, recognition)| TextRegion {
+                bbox: r.bbox,
+                detection_confidence: r.confidence,
+                recognition,
+            })
+            .collect())
     }
     pub fn ocr_with_detector(
         &mut self,
@@ -491,31 +528,45 @@ impl MangaOcr {
                 )));
             }
         }
-        let mut groups = Vec::with_capacity(regions.len());
-        for (i, r) in regions.into_iter().enumerate() {
+        // Every line's crops are cut first and read together, so the encoder can batch them.
+        let mut crops = Vec::new();
+        let mut blocks = Vec::with_capacity(regions.len());
+        for r in regions {
             let vertical = matches!(r.orientation, Orientation::Vertical);
             // A detector that found no lines in a block reads the block as its one line.
             let polygons = if r.line_polygons.is_empty() {
                 let [l, t, right, bottom] = r.bbox;
                 vec![[[l, t], [right, t], [right, bottom], [l, bottom]]]
             } else {
-                r.line_polygons
+                r.line_polygons.clone()
             };
+            let polygons: Vec<_> = polygons
+                .into_iter()
+                .map(|polygon| {
+                    let rect = [polygon[0][0], polygon[0][1], polygon[2][0], polygon[2][1]];
+                    let first = crops.len();
+                    crops.extend(lines::chunks(
+                        image,
+                        mask.as_ref(),
+                        rect,
+                        vertical,
+                        r.language,
+                        r.font_size,
+                    ));
+                    (polygon, first..crops.len())
+                })
+                .collect();
+            blocks.push((r, polygons));
+        }
+        let mut recognitions = self.recognize_all(&crops, options)?.into_iter();
+        let mut groups = Vec::with_capacity(blocks.len());
+        for (i, (r, polygons)) in blocks.into_iter().enumerate() {
             let mut line_polygons = Vec::with_capacity(polygons.len());
             let mut lines = Vec::with_capacity(polygons.len());
             let mut parts = Vec::new();
-            for polygon in polygons {
-                let rect = [polygon[0][0], polygon[0][1], polygon[2][0], polygon[2][1]];
+            for (polygon, chunks) in polygons {
                 let mut text = String::new();
-                for chunk in lines::chunks(
-                    image,
-                    mask.as_ref(),
-                    rect,
-                    vertical,
-                    r.language,
-                    r.font_size,
-                ) {
-                    let recognition = self.recognize(&chunk, options)?;
+                for recognition in recognitions.by_ref().take(chunks.len()) {
                     text.push_str(&recognition.text);
                     parts.push(recognition);
                 }
@@ -619,6 +670,10 @@ fn joined(parts: Vec<Recognition>) -> Recognition {
     out.mean_log_probability = (weight > 0.).then(|| total / weight);
     out
 }
+
+/// The most line crops the recognizer's encoder takes in one pass; see
+/// [`MangaOcr::recognize_all`].
+pub const ENCODE_BATCH: usize = 8;
 
 /// Below this mean token log-probability a whole-image read is invented text; see
 /// `MangaOcr::recognize_region`.

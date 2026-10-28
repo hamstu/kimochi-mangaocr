@@ -23,12 +23,12 @@ fn blocked(ids: &[u32], token: u32, n: usize) -> bool {
 }
 pub(crate) fn generate(
     model: &Model,
-    pixels: &Tensor,
+    encoded: &Tensor,
     device: &Device,
     options: &OcrOptions,
 ) -> Result<Hypothesis> {
     let b = options.beam_width;
-    let mut state = model.encode(pixels, b)?;
+    let mut state = model.start(encoded)?;
     let mut live = vec![
         Hypothesis {
             ids: vec![2],
