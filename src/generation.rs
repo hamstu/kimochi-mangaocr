@@ -13,6 +13,18 @@ impl Hypothesis {
         self.score / ((self.ids.len() - 1).max(1) as f64).powf(penalty)
     }
 }
+/// Every token `blocked` would refuse after `ids`.
+fn banned(ids: &[u32], n: usize) -> Vec<u32> {
+    if n == 0 || ids.len() + 1 < n {
+        return Vec::new();
+    }
+    let prefix = &ids[ids.len() - (n - 1)..];
+    ids.windows(n)
+        .filter(|w| &w[..n - 1] == prefix)
+        .map(|w| w[n - 1])
+        .collect()
+}
+#[cfg(test)]
 fn blocked(ids: &[u32], token: u32, n: usize) -> bool {
     if n == 0 || ids.len() + 1 < n {
         return false;
@@ -57,15 +69,14 @@ impl Beams {
             if !self.live[parent].score.is_finite() {
                 continue;
             }
+            // The few tokens that would repeat an n-gram, found once per beam (`blocked`'s
+            // test, without scanning the history for every token).
+            let banned = banned(&self.live[parent].ids, options.no_repeat_ngram_size);
             for (token, &score) in row.iter().enumerate() {
                 if score.is_nan() || score == f32::INFINITY {
                     return Err(Error::ModelContract("non-finite decoder logits".into()));
                 }
-                if blocked(
-                    &self.live[parent].ids,
-                    token as u32,
-                    options.no_repeat_ngram_size,
-                ) {
+                if banned.contains(&(token as u32)) {
                     continue;
                 }
                 let value = self.live[parent].score + f64::from(score);
@@ -162,5 +173,27 @@ mod tests {
         assert!(!blocked(&[2, 10, 11, 12, 10, 11], 13, 3));
         assert!(!blocked(&[2, 10], 10, 0));
         assert!(blocked(&[2, 10], 10, 1));
+    }
+    #[test]
+    fn banned_tokens_are_exactly_the_blocked_ones() {
+        let histories: [&[u32]; 5] = [
+            &[2, 10, 11, 12, 10, 11],
+            &[2, 10],
+            &[2, 7, 7, 7, 7],
+            &[2, 5, 6, 5, 6, 5],
+            &[2],
+        ];
+        for ids in histories {
+            for n in 0..5 {
+                let banned = banned(ids, n);
+                for token in 0..20 {
+                    assert_eq!(
+                        banned.contains(&token),
+                        blocked(ids, token, n),
+                        "{ids:?} n={n} t={token}"
+                    );
+                }
+            }
+        }
     }
 }

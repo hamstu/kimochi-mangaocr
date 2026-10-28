@@ -15,8 +15,10 @@ use crate::{
     finish, preprocess,
 };
 use image::RgbImage;
+use ort::memory::{AllocationDevice, AllocatorType, MemoryInfo, MemoryType};
 use ort::session::{Session, builder::GraphOptimizationLevel};
 use ort::value::{DynValue, Tensor};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -27,8 +29,11 @@ pub enum Provider {
     DirectMl,
 }
 
-/// The line crops one encoder pass and one batched decode take.
-const GROUP: usize = 32;
+/// The line crops one encoder pass takes.
+const ENCODE_BATCH: usize = 32;
+/// The lines one decode steps together. A page's lines go through in one: the decode takes as
+/// many steps as its longest line, so splitting a page multiplies the steps.
+const DECODE_LINES: usize = 128;
 
 fn session(model: &[u8], provider: Provider) -> Result<Session> {
     let mut builder = Session::builder()?
@@ -57,6 +62,15 @@ fn session(model: &[u8], provider: Provider) -> Result<Session> {
         }
     }
     Ok(builder.commit_from_memory(model)?)
+}
+
+fn host_memory() -> Result<MemoryInfo> {
+    Ok(MemoryInfo::new(
+        AllocationDevice::CPU,
+        0,
+        AllocatorType::Device,
+        MemoryType::Default,
+    )?)
 }
 
 /// The comic text detector's ONNX file, run by ONNX Runtime.
@@ -107,6 +121,7 @@ pub struct OnnxReader {
     step: Session,
     vocab: Vec<String>,
     beams: usize,
+    provider: Provider,
 }
 impl OnnxReader {
     /// Builds the graphs for `beams`-wide search from the checkpoint at `paths`.
@@ -121,6 +136,19 @@ impl OnnxReader {
             step,
             vocab,
             beams,
+            provider,
+        })
+    }
+    /// Where the decoder's cache stays between steps: on the GPU for DirectML.
+    fn cache_memory(&self) -> Result<MemoryInfo> {
+        Ok(match self.provider {
+            Provider::DirectMl => MemoryInfo::new(
+                AllocationDevice::DIRECTML,
+                0,
+                AllocatorType::Device,
+                MemoryType::Default,
+            )?,
+            Provider::Cpu => host_memory()?,
         })
     }
     /// Every line's search, its beams stepping through the decoder with all the others'.
@@ -133,6 +161,15 @@ impl OnnxReader {
         let w = self.beams;
         let rows = lines * w;
         let mut beams: Vec<_> = (0..lines).map(|_| Beams::new(w)).collect();
+        // The encoder's keys and values are copied to the device once and read by every step;
+        // the cache stays where the step leaves it. Only token ids, parents and the
+        // log-probabilities cross between host and device each step.
+        let mut binding = self.step.create_binding()?;
+        for (name, value) in ["ck0", "cv0", "ck1", "cv1"].into_iter().zip(cross) {
+            binding.bind_input(name, value)?;
+        }
+        let cache = self.cache_memory()?;
+        let host = host_memory()?;
         let mut done = vec![false; lines];
         // One masked slot of zeros stands for the empty cache.
         let mut past = (0..2 * graphs::LAYERS)
@@ -152,26 +189,42 @@ impl OnnxReader {
                     ids.extend(b.tokens().into_iter().map(i64::from));
                 }
             }
-            let mut out = self.step.run(ort::inputs![
-                "ids" => Tensor::from_array(([rows, 1], ids))?,
-                "pos" => Tensor::from_array(([1usize], vec![step as i64]))?,
-                "parent" => Tensor::from_array(([rows], parent))?,
-                "mask" => Tensor::from_array(([mask.len()], mask.clone()))?,
-                "pk0" => &past[0], "pv0" => &past[1], "pk1" => &past[2], "pv1" => &past[3],
-                "ck0" => &cross[0], "cv0" => &cross[1], "ck1" => &cross[2], "cv1" => &cross[3],
-            ])?;
+            binding.bind_input("ids", &Tensor::from_array(([rows, 1], ids))?)?;
+            binding.bind_input("pos", &Tensor::from_array(([1usize], vec![step as i64]))?)?;
+            binding.bind_input("parent", &Tensor::from_array(([rows], parent))?)?;
+            binding.bind_input("mask", &Tensor::from_array(([mask.len()], mask.clone()))?)?;
+            for (name, value) in ["pk0", "pv0", "pk1", "pv1"].into_iter().zip(&past) {
+                binding.bind_input(name, value)?;
+            }
+            // Rebound each step: a bound output keeps the last run's tensor, and the cache grows.
+            for name in ["nk0", "nv0", "nk1", "nv1"] {
+                binding.bind_output_to_device(name, &cache)?;
+            }
+            binding.bind_output_to_device("logp", &host)?;
+            let mut out = self.step.run_binding(&binding)?;
             let (_, logp) = out["logp"].try_extract_tensor::<f32>()?;
             let width = w * 6144;
-            let mut next = Vec::with_capacity(rows);
-            for j in 0..lines {
-                if !done[j] {
-                    match beams[j].advance(&logp[j * width..(j + 1) * width], options)? {
-                        Some(parents) => {
-                            next.extend(parents.into_iter().map(|p| (j * w) as i64 + i64::from(p)));
-                            continue;
-                        }
-                        None => done[j] = true,
+            // Each line's search is independent of the others'.
+            let advanced = beams
+                .par_iter_mut()
+                .enumerate()
+                .map(|(j, b)| {
+                    if done[j] {
+                        return Ok(None);
                     }
+                    b.advance(&logp[j * width..(j + 1) * width], options)
+                        .map(|parents| Some(parents.ok_or(())))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let mut next = Vec::with_capacity(rows);
+            for (j, advanced) in advanced.into_iter().enumerate() {
+                match advanced {
+                    Some(Ok(parents)) => {
+                        next.extend(parents.into_iter().map(|p| (j * w) as i64 + i64::from(p)));
+                        continue;
+                    }
+                    Some(Err(())) => done[j] = true,
+                    None => {}
                 }
                 // A finished line keeps its rows, stepping on EOS, until every line is done.
                 next.extend((0..w).map(|k| (j * w + k) as i64));
@@ -217,22 +270,33 @@ impl LineReader for OnnxReader {
                 pending.push(i);
             }
         }
-        for group in pending.chunks(GROUP) {
-            let mut pixels = Vec::with_capacity(group.len() * 3 * 224 * 224);
-            for &i in group {
-                pixels.extend(preprocess::pixel_data(&crops[i])?);
+        const CROSS: [(&str, [usize; 3]); 4] = [
+            ("ck0", [12, 64, 197]),
+            ("cv0", [12, 197, 64]),
+            ("ck1", [12, 64, 197]),
+            ("cv1", [12, 197, 64]),
+        ];
+        for group in pending.chunks(DECODE_LINES) {
+            // Encoded in batches, their keys and values gathered for one decode.
+            let mut cross: [Vec<f32>; 4] = Default::default();
+            for batch in group.chunks(ENCODE_BATCH) {
+                let mut pixels = Vec::with_capacity(batch.len() * 3 * 224 * 224);
+                for &i in batch {
+                    pixels.extend(preprocess::pixel_data(&crops[i])?);
+                }
+                let input = Tensor::from_array(([batch.len(), 3, 224, 224], pixels))?;
+                let encoded = self.encoder.run(ort::inputs!["pixels" => input])?;
+                for (all, (name, _)) in cross.iter_mut().zip(CROSS) {
+                    all.extend_from_slice(encoded[name].try_extract_tensor::<f32>()?.1);
+                }
             }
-            let input = Tensor::from_array(([group.len(), 3, 224, 224], pixels))?;
-            let mut encoded = self.encoder.run(ort::inputs!["pixels" => input])?;
-            let cross = ["ck0", "cv0", "ck1", "cv1"]
+            let cross = cross
                 .into_iter()
-                .map(|k| {
-                    encoded
-                        .remove(k)
-                        .ok_or_else(|| Error::ModelContract(format!("missing encoder output {k}")))
+                .zip(CROSS)
+                .map(|(data, (_, [a, b, c]))| {
+                    Ok(Tensor::from_array(([group.len(), a, b, c], data))?.into_dyn())
                 })
                 .collect::<Result<Vec<_>>>()?;
-            drop(encoded);
             for (&i, h) in group.iter().zip(self.decode(&cross, group.len(), options)?) {
                 out[i] = Some(finish(h, &self.vocab));
             }
